@@ -15,4 +15,4 @@ pre-push:
       glob: "*.py"
       run: uv run --extra dev mypy src/
     test:
-      run: uv run --extra dev pytest tests/ -v
+      run: uv run --extra dev pytest tests/ --ignore=tests/integration -v

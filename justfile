@@ -13,13 +13,25 @@ setup:
 install:
     uv sync --extra dev
 
-# Run tests
+# Run unit tests
 test *args:
-    uv run --extra dev pytest tests/ -v {{ args }}
+    uv run --extra dev pytest tests/ --ignore=tests/integration -v {{ args }}
 
-# Run tests with coverage report
+# Run integration tests (requires BLUEBUBBLES_URL and BLUEBUBBLES_PASSWORD)
+test-integration *args:
+    uv run --extra dev pytest tests/integration -v {{ args }}
+
+# Run unit tests with coverage report
 coverage:
-    uv run --extra dev pytest tests/ -v --cov=src/bb_mcp --cov-report=term-missing
+    uv run --extra dev pytest tests/ --ignore=tests/integration -v --cov=src/bb_mcp --cov-report=term-missing
+
+# Run smoke test against uvx config (requires BLUEBUBBLES_URL and BLUEBUBBLES_PASSWORD)
+smoke-uvx:
+    uv run scripts/smoke_uvx.py
+
+# Run smoke test against Docker config (requires BLUEBUBBLES_URL and BLUEBUBBLES_PASSWORD)
+smoke-docker:
+    uv run scripts/smoke_docker.py
 
 # Lint with ruff
 lint:
