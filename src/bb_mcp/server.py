@@ -68,7 +68,18 @@ async def lifespan(server: FastMCP):
 
 mcp = FastMCP(
     "BlueBubbles",
-    instructions="iMessage bridge via BlueBubbles",
+    instructions=(
+        "Use this server for anything involving iMessage or SMS text messages on the user's "
+        "Apple iPhone or Mac. It bridges the user's real personal messaging via BlueBubbles.\n\n"
+        "Covers: reading and sending iMessage/SMS, searching message history, managing group "
+        "chats, sending attachments/photos/files, scheduling future messages, tapback reactions, "
+        "editing/unsending messages, marking chats read/unread, looking up contacts, and checking "
+        "iMessage or FaceTime availability for a phone number or email.\n\n"
+        "Not for: email, phone/FaceTime calls, or other platforms (Slack, WhatsApp, Telegram).\n\n"
+        "All sends, reactions, and read receipts are real and visible to the other person. "
+        "Always confirm with the user before destructive actions (delete chat, unsend message, "
+        "remove participant)."
+    ),
     lifespan=lifespan,
 )
 
@@ -89,14 +100,20 @@ def _fmt(data: Any) -> str:
 
 @mcp.tool(annotations=READ_ONLY)
 async def get_server_info(ctx: Context) -> str:
-    """Get BlueBubbles server info and health status."""
+    """Get BlueBubbles server info and health status.
+
+    Returns version, OS, and configuration details for the BlueBubbles iMessage/SMS bridge server.
+    """
     data = await _bb(ctx).server_info()
     return _fmt(data)
 
 
 @mcp.tool(annotations=READ_ONLY)
 async def ping(ctx: Context) -> str:
-    """Ping the BlueBubbles server to check connectivity."""
+    """Ping the BlueBubbles server to check connectivity.
+
+    Verifies the iMessage/SMS bridge is reachable and responding.
+    """
     data = await _bb(ctx).ping()
     return _fmt(data)
 
@@ -112,7 +129,10 @@ async def list_chats(
     limit: int = 25,
     offset: int = 0,
 ) -> str:
-    """List iMessage conversations, sorted by most recent activity.
+    """List iMessage and SMS text message conversations, sorted by most recent activity.
+
+    Returns Apple iMessage and SMS chat threads from the bridged iPhone/Mac, including
+    direct messages and group chats. Each chat includes the last message preview.
 
     Args:
         limit: Max number of chats to return (default 25).
@@ -126,7 +146,10 @@ async def list_chats(
 
 @mcp.tool(annotations=READ_ONLY)
 async def get_chat(ctx: Context, chat_guid: str) -> str:
-    """Get details for a specific chat, including participants.
+    """Get details for a specific iMessage or SMS chat, including participants.
+
+    Returns full chat metadata, participant phone numbers or emails, and the last message
+    for an Apple iMessage or SMS text message conversation.
 
     Args:
         chat_guid: The chat GUID (e.g. 'iMessage;-;+15551234567' or 'iMessage;+;chat123').
@@ -147,7 +170,10 @@ async def get_chat_messages(
     after: int | None = None,
     before: int | None = None,
 ) -> str:
-    """Get messages from a specific chat.
+    """Get iMessage or SMS text messages from a specific chat conversation.
+
+    Retrieves the message history for an Apple iMessage or SMS thread, with optional
+    time range filtering. Messages include sender, timestamp, text body, and attachments.
 
     Args:
         chat_guid: The chat GUID.
@@ -169,7 +195,10 @@ async def get_recent_messages(
     minutes: int = 60,
     limit: int = 50,
 ) -> str:
-    """Get recent messages across all chats within a time window.
+    """Get recent iMessage and SMS text messages across all conversations within a time window.
+
+    Fetches the latest Apple iMessage and SMS messages received on the bridged iPhone/Mac
+    across all chats, useful for checking what text messages arrived recently.
 
     Args:
         minutes: How far back to look (default 60 minutes).
@@ -182,7 +211,10 @@ async def get_recent_messages(
 
 @mcp.tool(annotations=READ_ONLY)
 async def get_unread_chats(ctx: Context, message_limit: int = 5) -> str:
-    """Get all chats with unread messages, including their latest messages.
+    """Get all iMessage and SMS conversations with unread text messages.
+
+    Returns Apple iMessage and SMS chats that have unread messages on the bridged
+    iPhone/Mac, along with their most recent messages.
 
     Args:
         message_limit: Number of recent messages to include per unread chat (default 5).
@@ -211,7 +243,10 @@ async def get_unread_chats(ctx: Context, message_limit: int = 5) -> str:
     )
 )
 async def mark_chat_read(ctx: Context, chat_guid: str) -> str:
-    """Mark a chat as read (sends read receipt visible to the other person).
+    """Mark an iMessage or SMS conversation as read, sending a read receipt.
+
+    Marks the Apple iMessage or SMS thread as read on the bridged iPhone/Mac.
+    The read receipt is visible to the other person in iMessage threads.
 
     Args:
         chat_guid: The chat GUID.
@@ -222,7 +257,7 @@ async def mark_chat_read(ctx: Context, chat_guid: str) -> str:
 
 @mcp.tool(annotations=IDEMPOTENT_WRITE)
 async def mark_chat_unread(ctx: Context, chat_guid: str) -> str:
-    """Mark a chat as unread.
+    """Mark an iMessage or SMS conversation as unread.
 
     Args:
         chat_guid: The chat GUID.
@@ -233,7 +268,9 @@ async def mark_chat_unread(ctx: Context, chat_guid: str) -> str:
 
 @mcp.tool(annotations=SEND)
 async def start_typing(ctx: Context, chat_guid: str) -> str:
-    """Show a typing indicator in a chat (visible to the other person).
+    """Show a typing indicator in an iMessage chat (visible to the other person).
+
+    Sends an Apple iMessage typing indicator to the other participants in the chat.
 
     Args:
         chat_guid: The chat GUID.
@@ -244,7 +281,7 @@ async def start_typing(ctx: Context, chat_guid: str) -> str:
 
 @mcp.tool(annotations=SEND)
 async def stop_typing(ctx: Context, chat_guid: str) -> str:
-    """Stop the typing indicator in a chat.
+    """Stop the typing indicator in an iMessage chat.
 
     Args:
         chat_guid: The chat GUID.
@@ -255,7 +292,10 @@ async def stop_typing(ctx: Context, chat_guid: str) -> str:
 
 @mcp.tool(annotations=DESTRUCTIVE)
 async def delete_chat(ctx: Context, chat_guid: str) -> str:
-    """Delete an entire chat conversation. This is irreversible.
+    """Delete an entire iMessage or SMS conversation. This is irreversible.
+
+    Permanently deletes the Apple iMessage or SMS text message thread from the
+    bridged iPhone/Mac.
 
     Args:
         chat_guid: The chat GUID to delete.
@@ -276,7 +316,10 @@ async def send_message(
     message: str,
     reply_to_guid: str | None = None,
 ) -> str:
-    """Send a text message to an existing chat.
+    """Send an iMessage or SMS text message to an existing conversation.
+
+    Sends an Apple iMessage or SMS text to the specified chat thread on the
+    bridged iPhone/Mac. Supports threaded replies.
 
     Args:
         chat_guid: The chat GUID to send to.
@@ -294,7 +337,10 @@ async def send_message_to_address(
     message: str,
     service: str = "iMessage",
 ) -> str:
-    """Send a message to a phone number or email, creating a new chat if needed.
+    """Send an iMessage or SMS text message to a phone number or email address.
+
+    Sends an Apple iMessage or SMS text to a mobile phone number or email, creating
+    a new chat thread if one does not already exist on the bridged iPhone/Mac.
 
     Args:
         address: Phone number (e.g. '+15551234567') or email address.
@@ -312,7 +358,10 @@ async def send_reaction(
     message_guid: str,
     reaction: str,
 ) -> str:
-    """Send a tapback reaction to a message.
+    """Send an Apple iMessage tapback reaction (like, love, laugh, etc.) to a text message.
+
+    Sends an Apple iMessage tapback emoji reaction to a specific message in a chat.
+    Only works on iMessage threads (not SMS).
 
     Args:
         chat_guid: The chat GUID containing the message.
@@ -330,10 +379,13 @@ async def edit_message(
     message_guid: str,
     new_text: str,
 ) -> str:
-    """Edit a previously sent message.
+    """Edit a previously sent iMessage text message.
+
+    Edits an Apple iMessage that was already sent. Only works on iMessage (not SMS)
+    and only on messages sent from this device.
 
     Args:
-        message_guid: GUID of the message to edit.
+        message_guid: GUID of the iMessage to edit.
         new_text: The new message text.
     """
     data = await _bb(ctx).edit_message(message_guid, new_text)
@@ -342,10 +394,13 @@ async def edit_message(
 
 @mcp.tool(annotations=DESTRUCTIVE)
 async def unsend_message(ctx: Context, message_guid: str) -> str:
-    """Unsend (retract) a previously sent message.
+    """Unsend (retract) a previously sent iMessage text message.
+
+    Retracts an Apple iMessage that was already sent, removing it for all participants.
+    Only works on iMessage (not SMS) and only on recently sent messages.
 
     Args:
-        message_guid: GUID of the message to unsend.
+        message_guid: GUID of the iMessage to unsend.
     """
     data = await _bb(ctx).unsend_message(message_guid)
     return _fmt(data)
@@ -361,11 +416,14 @@ async def search_messages(
     after: int | None = None,
     before: int | None = None,
 ) -> str:
-    """Search messages by text content and/or filter by chat and time range.
+    """Search iMessage and SMS text messages by content, chat, or time range.
+
+    Full-text search across Apple iMessage and SMS text message history on the
+    bridged iPhone/Mac. Filter by keyword, conversation, or date range.
 
     Args:
         query: Text to search for in message bodies.
-        chat_guid: Limit search to a specific chat.
+        chat_guid: Limit search to a specific iMessage or SMS chat.
         limit: Max results (default 25).
         offset: Pagination offset.
         after: Only messages after this epoch-ms timestamp.
@@ -384,7 +442,10 @@ async def search_messages(
 
 @mcp.tool(annotations=READ_ONLY)
 async def get_message(ctx: Context, message_guid: str) -> str:
-    """Get a single message by its GUID, including chat and attachment info.
+    """Get a single iMessage or SMS text message by its GUID.
+
+    Returns the full message details including sender, timestamp, text body,
+    chat context, and any attachments for an Apple iMessage or SMS text message.
 
     Args:
         message_guid: The message GUID.
@@ -400,17 +461,24 @@ async def get_message(ctx: Context, message_guid: str) -> str:
 
 @mcp.tool(annotations=READ_ONLY)
 async def get_contacts(ctx: Context) -> str:
-    """Get all contacts from the server."""
+    """Get all contacts from the Apple iPhone/Mac address book via BlueBubbles.
+
+    Returns the contact list from the device running the BlueBubbles iMessage bridge,
+    including names, phone numbers, and email addresses.
+    """
     data = await _bb(ctx).get_contacts()
     return _fmt(data)
 
 
 @mcp.tool(annotations=READ_ONLY)
 async def lookup_contact(ctx: Context, addresses: list[str]) -> str:
-    """Look up contacts by phone numbers or email addresses.
+    """Look up Apple iPhone contacts by phone number or email address.
+
+    Resolves phone numbers or email addresses to contact names and details
+    from the address book on the BlueBubbles-bridged iPhone/Mac.
 
     Args:
-        addresses: List of phone numbers or emails to look up.
+        addresses: List of phone numbers or email addresses to look up.
     """
     data = await _bb(ctx).query_contacts(addresses)
     return _fmt(data)
@@ -418,7 +486,10 @@ async def lookup_contact(ctx: Context, addresses: list[str]) -> str:
 
 @mcp.tool(annotations=READ_ONLY)
 async def check_imessage(ctx: Context, address: str) -> str:
-    """Check if a phone number or email is registered for iMessage.
+    """Check if a phone number or email is registered for Apple iMessage.
+
+    Determines whether a contact can receive iMessage (blue bubble) vs SMS only
+    (green bubble) on Apple iPhone or Mac.
 
     Args:
         address: Phone number or email to check.
@@ -429,7 +500,7 @@ async def check_imessage(ctx: Context, address: str) -> str:
 
 @mcp.tool(annotations=READ_ONLY)
 async def check_facetime(ctx: Context, address: str) -> str:
-    """Check if a phone number or email is registered for FaceTime.
+    """Check if a phone number or email is registered for Apple FaceTime.
 
     Args:
         address: Phone number or email to check.
@@ -445,10 +516,12 @@ async def check_facetime(ctx: Context, address: str) -> str:
 
 @mcp.tool(annotations=IDEMPOTENT_WRITE)
 async def rename_group(ctx: Context, chat_guid: str, name: str) -> str:
-    """Rename a group chat.
+    """Rename an iMessage group chat.
+
+    Sets a new display name for an Apple iMessage group text message thread.
 
     Args:
-        chat_guid: The group chat GUID.
+        chat_guid: The iMessage group chat GUID.
         name: New display name for the group.
     """
     data = await _bb(ctx).rename_group(chat_guid, name)
@@ -457,10 +530,12 @@ async def rename_group(ctx: Context, chat_guid: str, name: str) -> str:
 
 @mcp.tool(annotations=SEND)
 async def add_participant(ctx: Context, chat_guid: str, address: str) -> str:
-    """Add a participant to a group chat.
+    """Add a participant to an iMessage group chat.
+
+    Adds a contact by phone number or email to an Apple iMessage group text thread.
 
     Args:
-        chat_guid: The group chat GUID.
+        chat_guid: The iMessage group chat GUID.
         address: Phone number or email of the person to add.
     """
     data = await _bb(ctx).add_participant(chat_guid, address)
@@ -469,10 +544,12 @@ async def add_participant(ctx: Context, chat_guid: str, address: str) -> str:
 
 @mcp.tool(annotations=DESTRUCTIVE)
 async def remove_participant(ctx: Context, chat_guid: str, address: str) -> str:
-    """Remove a participant from a group chat.
+    """Remove a participant from an iMessage group chat.
+
+    Removes a contact from an Apple iMessage group text thread by phone number or email.
 
     Args:
-        chat_guid: The group chat GUID.
+        chat_guid: The iMessage group chat GUID.
         address: Phone number or email of the person to remove.
     """
     data = await _bb(ctx).remove_participant(chat_guid, address)
@@ -481,10 +558,12 @@ async def remove_participant(ctx: Context, chat_guid: str, address: str) -> str:
 
 @mcp.tool(annotations=DESTRUCTIVE)
 async def leave_chat(ctx: Context, chat_guid: str) -> str:
-    """Leave a group chat.
+    """Leave an iMessage group chat.
+
+    Exits an Apple iMessage group text message thread.
 
     Args:
-        chat_guid: The group chat GUID to leave.
+        chat_guid: The iMessage group chat GUID to leave.
     """
     await _bb(ctx).leave_chat(chat_guid)
     return "Left the group chat."
@@ -497,7 +576,10 @@ async def leave_chat(ctx: Context, chat_guid: str) -> str:
 
 @mcp.tool(annotations=READ_ONLY)
 async def list_scheduled_messages(ctx: Context) -> str:
-    """List all scheduled (future) messages."""
+    """List all scheduled future iMessage and SMS text messages.
+
+    Returns queued messages waiting to be sent via the BlueBubbles iMessage/SMS bridge.
+    """
     data = await _bb(ctx).list_scheduled_messages()
     return _fmt(data)
 
@@ -509,10 +591,13 @@ async def schedule_message(
     message: str,
     scheduled_for: int,
 ) -> str:
-    """Schedule a message to be sent at a future time.
+    """Schedule an iMessage or SMS text message to be sent at a future time.
+
+    Queues an Apple iMessage or SMS text to be delivered automatically at the
+    specified time via the BlueBubbles bridge.
 
     Args:
-        chat_guid: The chat GUID to send to.
+        chat_guid: The iMessage or SMS chat GUID to send to.
         message: The message text.
         scheduled_for: When to send, as epoch milliseconds.
     """
@@ -522,7 +607,7 @@ async def schedule_message(
 
 @mcp.tool(annotations=DESTRUCTIVE)
 async def delete_scheduled_message(ctx: Context, schedule_id: int) -> str:
-    """Delete a scheduled message.
+    """Cancel and delete a scheduled iMessage or SMS text message.
 
     Args:
         schedule_id: The ID of the scheduled message to cancel.
@@ -538,7 +623,10 @@ async def delete_scheduled_message(ctx: Context, schedule_id: int) -> str:
 
 @mcp.tool(annotations=READ_ONLY)
 async def get_attachment_info(ctx: Context, attachment_guid: str) -> str:
-    """Get metadata for an attachment (filename, mime type, size, etc.).
+    """Get metadata for an iMessage or SMS attachment (photo, video, file, etc.).
+
+    Returns filename, MIME type, and size for a media file or document attached
+    to an Apple iMessage or SMS text message.
 
     Args:
         attachment_guid: The attachment GUID.
@@ -549,7 +637,10 @@ async def get_attachment_info(ctx: Context, attachment_guid: str) -> str:
 
 @mcp.tool(annotations=READ_ONLY)
 async def download_attachment(ctx: Context, attachment_guid: str) -> str:
-    """Download an attachment and return it as base64-encoded data.
+    """Download a photo, video, or file attachment from an iMessage or SMS text message.
+
+    Retrieves the binary content of a media file or document attached to an Apple
+    iMessage or SMS text message, returned as base64-encoded data.
 
     Args:
         attachment_guid: The attachment GUID.
@@ -574,10 +665,13 @@ async def send_attachment(
     filename: str,
     mime_type: str = "application/octet-stream",
 ) -> str:
-    """Send a file attachment to a chat.
+    """Send a photo, video, or file attachment via iMessage or SMS.
+
+    Sends a media file or document to an Apple iMessage or SMS chat thread
+    on the bridged iPhone/Mac.
 
     Args:
-        chat_guid: The chat GUID to send to.
+        chat_guid: The iMessage or SMS chat GUID to send to.
         data_base64: The file contents as a base64-encoded string.
         filename: The filename (e.g. 'photo.jpg').
         mime_type: MIME type (e.g. 'image/jpeg'). Defaults to 'application/octet-stream'.
