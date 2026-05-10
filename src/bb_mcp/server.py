@@ -591,5 +591,10 @@ async def send_attachment(
 # Entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+
+def main() -> None:
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

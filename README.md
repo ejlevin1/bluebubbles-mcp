@@ -4,22 +4,92 @@ MCP server for [BlueBubbles](https://bluebubbles.app) — access iMessage from a
 
 Built from scratch with no third-party MCP dependencies beyond the official [`mcp`](https://pypi.org/project/mcp/) SDK and [`httpx`](https://pypi.org/project/httpx/).
 
+> **This project is a fork of [metaember/bluebubbles-mcp](https://github.com/metaember/bluebubbles-mcp).**
+> The original implementation, architecture, and toolset were created by [@metaember](https://github.com/metaember) — huge credit to them for the excellent foundation this builds on.
+
 ## Prerequisites
 
-- Python 3.11+
 - A running [BlueBubbles server](https://bluebubbles.app) with API access enabled
+- Python 3.11+ **or** Docker
 
 ## Setup
 
+### Docker (recommended)
+
+Pull and run the pre-built image from GitHub Container Registry:
+
 ```bash
-git clone https://github.com/metaember/bluebubbles-mcp.git
+docker run --rm -i \
+  -e BLUEBUBBLES_URL=https://your-bluebubbles-server \
+  -e BLUEBUBBLES_PASSWORD=your-server-password \
+  ghcr.io/ejlevin1/bluebubbles-mcp:latest
+```
+
+Or use docker-compose for local development (copy `.env.example` to `.env` and fill in your values):
+
+```bash
+BLUEBUBBLES_URL=https://your-bluebubbles-server \
+BLUEBUBBLES_PASSWORD=your-server-password \
+docker compose up
+```
+
+### uvx (no install required)
+
+Run directly from the GitHub repo without cloning:
+
+```bash
+uvx --from git+https://github.com/ejlevin1/bluebubbles-mcp bb-mcp
+```
+
+### From source
+
+```bash
+git clone https://github.com/ejlevin1/bluebubbles-mcp.git
 cd bluebubbles-mcp
-uv sync
+just setup   # installs deps and git hooks
 ```
 
 ## Configuration
 
-Add to your MCP client config (e.g. Claude Code `~/.claude/settings.json`):
+### uvx (Claude Code / MCP client)
+
+```json
+{
+  "mcpServers": {
+    "bluebubbles": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/ejlevin1/bluebubbles-mcp", "bb-mcp"],
+      "env": {
+        "BLUEBUBBLES_URL": "https://your-bluebubbles-server",
+        "BLUEBUBBLES_PASSWORD": "your-server-password"
+      }
+    }
+  }
+}
+```
+
+### Docker (Claude Code / MCP client)
+
+```json
+{
+  "mcpServers": {
+    "bluebubbles": {
+      "command": "docker",
+      "args": ["run", "--rm", "-i",
+        "-e", "BLUEBUBBLES_URL",
+        "-e", "BLUEBUBBLES_PASSWORD",
+        "ghcr.io/ejlevin1/bluebubbles-mcp:latest"
+      ],
+      "env": {
+        "BLUEBUBBLES_URL": "https://your-bluebubbles-server",
+        "BLUEBUBBLES_PASSWORD": "your-server-password"
+      }
+    }
+  }
+}
+```
+
+### From source (Claude Code / MCP client)
 
 ```json
 {

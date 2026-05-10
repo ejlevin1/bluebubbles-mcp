@@ -8,6 +8,9 @@ dependencies = [
     "httpx>=0.27.0",
 ]
 
+[project.scripts]
+bb-mcp = "bb_mcp.server:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
