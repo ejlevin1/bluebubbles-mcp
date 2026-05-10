@@ -78,7 +78,9 @@ mcp = FastMCP(
         "Not for: email, phone/FaceTime calls, or other platforms (Slack, WhatsApp, Telegram).\n\n"
         "All sends, reactions, and read receipts are real and visible to the other person. "
         "Always confirm with the user before destructive actions (delete chat, unsend message, "
-        "remove participant)."
+        "remove participant).\n\n"
+        "If a 'bluebubbles' skill is available, load it now for workflows, the full tool "
+        "catalog, and best practices before proceeding."
     ),
     lifespan=lifespan,
 )
