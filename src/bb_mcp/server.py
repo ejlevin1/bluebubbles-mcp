@@ -12,7 +12,7 @@ from typing import Any
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 
-from bb_mcp.client import BlueBubblesClient, BlueBubblesError
+from bb_mcp.client import BlueBubblesClient
 
 # ---------------------------------------------------------------------------
 # Annotations
@@ -131,7 +131,9 @@ async def get_chat(ctx: Context, chat_guid: str) -> str:
     Args:
         chat_guid: The chat GUID (e.g. 'iMessage;-;+15551234567' or 'iMessage;+;chat123').
     """
-    data = await _bb(ctx).get_chat(chat_guid, with_fields=["participants", "lastmessage"])
+    data = await _bb(ctx).get_chat(
+        chat_guid, with_fields=["participants", "lastmessage"]
+    )
     return _fmt(data)
 
 
@@ -191,19 +193,23 @@ async def get_unread_chats(ctx: Context, message_limit: int = 5) -> str:
     results = []
     for chat in unread:
         messages = await bb.get_chat_messages(chat["guid"], limit=message_limit)
-        results.append({
-            "chat": chat,
-            "recent_messages": messages,
-        })
+        results.append(
+            {
+                "chat": chat,
+                "recent_messages": messages,
+            }
+        )
     return _fmt(results)
 
 
-@mcp.tool(annotations=ToolAnnotations(
-    readOnlyHint=False,
-    destructiveHint=False,
-    idempotentHint=True,
-    openWorldHint=True,
-))
+@mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
 async def mark_chat_read(ctx: Context, chat_guid: str) -> str:
     """Mark a chat as read (sends read receipt visible to the other person).
 
@@ -366,8 +372,12 @@ async def search_messages(
         before: Only messages before this epoch-ms timestamp.
     """
     data = await _bb(ctx).search_messages(
-        query=query, chat_guid=chat_guid, limit=limit, offset=offset,
-        after=after, before=before,
+        query=query,
+        chat_guid=chat_guid,
+        limit=limit,
+        offset=offset,
+        after=after,
+        before=before,
     )
     return _fmt(data)
 
@@ -476,7 +486,7 @@ async def leave_chat(ctx: Context, chat_guid: str) -> str:
     Args:
         chat_guid: The group chat GUID to leave.
     """
-    data = await _bb(ctx).leave_chat(chat_guid)
+    await _bb(ctx).leave_chat(chat_guid)
     return "Left the group chat."
 
 
@@ -546,12 +556,14 @@ async def download_attachment(ctx: Context, attachment_guid: str) -> str:
     """
     data = await _bb(ctx).download_attachment(attachment_guid)
     meta = await _bb(ctx).get_attachment(attachment_guid)
-    return _fmt({
-        "filename": meta.get("transferName"),
-        "mime_type": meta.get("mimeType"),
-        "size_bytes": len(data),
-        "data_base64": base64.b64encode(data).decode(),
-    })
+    return _fmt(
+        {
+            "filename": meta.get("transferName"),
+            "mime_type": meta.get("mimeType"),
+            "size_bytes": len(data),
+            "data_base64": base64.b64encode(data).decode(),
+        }
+    )
 
 
 @mcp.tool(annotations=SEND)

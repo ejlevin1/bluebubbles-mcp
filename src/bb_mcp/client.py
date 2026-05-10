@@ -34,9 +34,7 @@ class BlueBubblesClient:
         return params
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        resp = await self._http.get(
-            self._url(path), params=self._auth_params(params)
-        )
+        resp = await self._http.get(self._url(path), params=self._auth_params(params))
         resp.raise_for_status()
         body = resp.json()
         if body.get("status") and body["status"] >= 400:
@@ -44,7 +42,10 @@ class BlueBubblesClient:
         return body.get("data")
 
     async def _post(
-        self, path: str, json: dict[str, Any] | None = None, params: dict[str, Any] | None = None
+        self,
+        path: str,
+        json: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
     ) -> Any:
         resp = await self._http.post(
             self._url(path), json=json, params=self._auth_params(params)
@@ -66,7 +67,10 @@ class BlueBubblesClient:
         return body.get("data")
 
     async def _put(
-        self, path: str, json: dict[str, Any] | None = None, params: dict[str, Any] | None = None
+        self,
+        path: str,
+        json: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
     ) -> Any:
         resp = await self._http.put(
             self._url(path), json=json, params=self._auth_params(params)
@@ -103,7 +107,9 @@ class BlueBubblesClient:
             body["with"] = with_fields
         return await self._post("/chat/query", json=body)
 
-    async def get_chat(self, chat_guid: str, with_fields: list[str] | None = None) -> dict[str, Any]:
+    async def get_chat(
+        self, chat_guid: str, with_fields: list[str] | None = None
+    ) -> dict[str, Any]:
         params: dict[str, Any] = {}
         if with_fields:
             params["with"] = ",".join(with_fields)
@@ -149,10 +155,14 @@ class BlueBubblesClient:
         return await self._put(f"/chat/{chat_guid}", json={"displayName": display_name})
 
     async def add_participant(self, chat_guid: str, address: str) -> Any:
-        return await self._post(f"/chat/{chat_guid}/participant/add", json={"address": address})
+        return await self._post(
+            f"/chat/{chat_guid}/participant/add", json={"address": address}
+        )
 
     async def remove_participant(self, chat_guid: str, address: str) -> Any:
-        return await self._post(f"/chat/{chat_guid}/participant/remove", json={"address": address})
+        return await self._post(
+            f"/chat/{chat_guid}/participant/remove", json={"address": address}
+        )
 
     async def leave_chat(self, chat_guid: str) -> Any:
         return await self._post(f"/chat/{chat_guid}/leave")
@@ -219,7 +229,8 @@ class BlueBubblesClient:
     ) -> Any:
         body: dict[str, Any] = {
             "editedMessage": new_text,
-            "backwardsCompatibilityMessage": backwards_compat or f"Edited to: {new_text}",
+            "backwardsCompatibilityMessage": backwards_compat
+            or f"Edited to: {new_text}",
             "partIndex": part_index,
         }
         return await self._post(f"/message/{message_guid}/edit", json=body)
@@ -252,7 +263,12 @@ class BlueBubblesClient:
         if before:
             body["before"] = before
         if query:
-            body["where"] = [{"statement": "message.text LIKE :query", "args": {"query": f"%{query}%"}}]
+            body["where"] = [
+                {
+                    "statement": "message.text LIKE :query",
+                    "args": {"query": f"%{query}%"},
+                }
+            ]
         return await self._post("/message/query", json=body)
 
     async def get_message(self, message_guid: str) -> dict[str, Any]:
@@ -272,10 +288,14 @@ class BlueBubblesClient:
     # -- handles --------------------------------------------------------------
 
     async def check_imessage_availability(self, address: str) -> Any:
-        return await self._get("/handle/availability/imessage", params={"address": address})
+        return await self._get(
+            "/handle/availability/imessage", params={"address": address}
+        )
 
     async def check_facetime_availability(self, address: str) -> Any:
-        return await self._get("/handle/availability/facetime", params={"address": address})
+        return await self._get(
+            "/handle/availability/facetime", params={"address": address}
+        )
 
     # -- attachments ----------------------------------------------------------
 
@@ -339,6 +359,8 @@ class BlueBubblesClient:
 
 
 class BlueBubblesError(Exception):
-    def __init__(self, message: str, response_body: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self, message: str, response_body: dict[str, Any] | None = None
+    ) -> None:
         super().__init__(message)
         self.response_body = response_body

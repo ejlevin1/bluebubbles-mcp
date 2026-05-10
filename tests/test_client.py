@@ -20,12 +20,15 @@ PASSWORD = "test-secret"
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def ok_json(data: Any = None, *, status: int = 200) -> httpx.Response:
     """Build a successful BlueBubbles-style JSON response."""
     return httpx.Response(status, json={"status": 200, "data": data})
 
 
-def api_error_json(message: str = "Not found", *, api_status: int = 404) -> httpx.Response:
+def api_error_json(
+    message: str = "Not found", *, api_status: int = 404
+) -> httpx.Response:
     """Build a response where HTTP is 200 but the API body signals an error."""
     return httpx.Response(200, json={"status": api_status, "message": message})
 
@@ -33,6 +36,7 @@ def api_error_json(message: str = "Not found", *, api_status: int = 404) -> http
 # ===========================================================================
 # Construction & helpers
 # ===========================================================================
+
 
 class TestClientInit:
     def test_trailing_slash_stripped(self) -> None:
@@ -63,6 +67,7 @@ class TestClientInit:
 # Internal HTTP methods – happy & error paths
 # ===========================================================================
 
+
 class TestInternalGet:
     async def test_get_returns_data(
         self, client: BlueBubblesClient, mock_api: respx.Router
@@ -91,7 +96,9 @@ class TestInternalGet:
     async def test_get_api_error_raises(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
-        mock_api.get(f"{API}/bad").mock(return_value=api_error_json("Oops", api_status=400))
+        mock_api.get(f"{API}/bad").mock(
+            return_value=api_error_json("Oops", api_status=400)
+        )
         with pytest.raises(BlueBubblesError, match="Oops"):
             await client._get("/bad")
 
@@ -112,12 +119,15 @@ class TestInternalPost:
         route = mock_api.post(f"{API}/action").mock(return_value=ok_json("done"))
         await client._post("/action", json={"key": "val"})
         import json
+
         assert json.loads(route.calls[0].request.content) == {"key": "val"}
 
     async def test_post_api_error(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
-        mock_api.post(f"{API}/action").mock(return_value=api_error_json("fail", api_status=422))
+        mock_api.post(f"{API}/action").mock(
+            return_value=api_error_json("fail", api_status=422)
+        )
         with pytest.raises(BlueBubblesError, match="fail"):
             await client._post("/action")
 
@@ -133,7 +143,9 @@ class TestInternalDelete:
     async def test_delete_api_error(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
-        mock_api.delete(f"{API}/thing/1").mock(return_value=api_error_json("nope", api_status=403))
+        mock_api.delete(f"{API}/thing/1").mock(
+            return_value=api_error_json("nope", api_status=403)
+        )
         with pytest.raises(BlueBubblesError, match="nope"):
             await client._delete("/thing/1")
 
@@ -146,12 +158,15 @@ class TestInternalPut:
         result = await client._put("/item", json={"x": 1})
         assert result == "updated"
         import json
+
         assert json.loads(route.calls[0].request.content) == {"x": 1}
 
     async def test_put_api_error(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
-        mock_api.put(f"{API}/item").mock(return_value=api_error_json("bad", api_status=400))
+        mock_api.put(f"{API}/item").mock(
+            return_value=api_error_json("bad", api_status=400)
+        )
         with pytest.raises(BlueBubblesError, match="bad"):
             await client._put("/item")
 
@@ -159,6 +174,7 @@ class TestInternalPut:
 # ===========================================================================
 # Server endpoints
 # ===========================================================================
+
 
 class TestServerEndpoints:
     async def test_ping(
@@ -179,6 +195,7 @@ class TestServerEndpoints:
 # Chat endpoints
 # ===========================================================================
 
+
 class TestChats:
     async def test_list_chats_defaults(
         self, client: BlueBubblesClient, mock_api: respx.Router
@@ -189,6 +206,7 @@ class TestChats:
         assert result == chats
         body = route.calls[0].request.content
         import json
+
         parsed = json.loads(body)
         assert parsed["limit"] == 25
         assert parsed["offset"] == 0
@@ -201,6 +219,7 @@ class TestChats:
         route = mock_api.post(f"{API}/chat/query").mock(return_value=ok_json([]))
         await client.list_chats(limit=10, offset=5, with_fields=["participants"])
         import json
+
         parsed = json.loads(route.calls[0].request.content)
         assert parsed["limit"] == 10
         assert parsed["offset"] == 5
@@ -219,7 +238,9 @@ class TestChats:
     ) -> None:
         route = mock_api.get(f"{API}/chat/g1").mock(return_value=ok_json({}))
         await client.get_chat("g1", with_fields=["participants", "lastMessage"])
-        assert route.calls[0].request.url.params.get("with") == "participants,lastMessage"
+        assert (
+            route.calls[0].request.url.params.get("with") == "participants,lastMessage"
+        )
 
     async def test_get_chat_messages_defaults(
         self, client: BlueBubblesClient, mock_api: respx.Router
@@ -237,7 +258,9 @@ class TestChats:
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
         route = mock_api.get(f"{API}/chat/g1/message").mock(return_value=ok_json([]))
-        await client.get_chat_messages("g1", after=100, before=200, limit=5, offset=10, sort="ASC")
+        await client.get_chat_messages(
+            "g1", after=100, before=200, limit=5, offset=10, sort="ASC"
+        )
         params = route.calls[0].request.url.params
         assert params.get("after") == "100"
         assert params.get("before") == "200"
@@ -281,22 +304,29 @@ class TestChats:
         route = mock_api.put(f"{API}/chat/g1").mock(return_value=ok_json(None))
         await client.rename_group("g1", "New Name")
         import json
+
         assert json.loads(route.calls[0].request.content) == {"displayName": "New Name"}
 
     async def test_add_participant(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
-        route = mock_api.post(f"{API}/chat/g1/participant/add").mock(return_value=ok_json(None))
+        route = mock_api.post(f"{API}/chat/g1/participant/add").mock(
+            return_value=ok_json(None)
+        )
         await client.add_participant("g1", "+15551234567")
         import json
+
         assert json.loads(route.calls[0].request.content) == {"address": "+15551234567"}
 
     async def test_remove_participant(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
-        route = mock_api.post(f"{API}/chat/g1/participant/remove").mock(return_value=ok_json(None))
+        route = mock_api.post(f"{API}/chat/g1/participant/remove").mock(
+            return_value=ok_json(None)
+        )
         await client.remove_participant("g1", "+15551234567")
         import json
+
         assert json.loads(route.calls[0].request.content) == {"address": "+15551234567"}
 
     async def test_leave_chat(
@@ -310,14 +340,18 @@ class TestChats:
 # Message endpoints
 # ===========================================================================
 
+
 class TestMessages:
     async def test_send_message_defaults(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
-        route = mock_api.post(f"{API}/message/text").mock(return_value=ok_json({"guid": "m1"}))
+        route = mock_api.post(f"{API}/message/text").mock(
+            return_value=ok_json({"guid": "m1"})
+        )
         result = await client.send_message("g1", "Hello!")
         assert result == {"guid": "m1"}
         import json
+
         body = json.loads(route.calls[0].request.content)
         assert body["chatGuid"] == "g1"
         assert body["message"] == "Hello!"
@@ -331,9 +365,14 @@ class TestMessages:
     ) -> None:
         route = mock_api.post(f"{API}/message/text").mock(return_value=ok_json({}))
         await client.send_message(
-            "g1", "Hi", method="apple-script", subject="Subj", reply_to_guid="reply-guid"
+            "g1",
+            "Hi",
+            method="apple-script",
+            subject="Subj",
+            reply_to_guid="reply-guid",
         )
         import json
+
         body = json.loads(route.calls[0].request.content)
         assert body["method"] == "apple-script"
         assert body["subject"] == "Subj"
@@ -344,6 +383,7 @@ class TestMessages:
     ) -> None:
         mock_api.post(f"{API}/message/text").mock(return_value=ok_json({}))
         import json
+
         guids = set()
         for _ in range(5):
             await client.send_message("g1", "hi")
@@ -355,10 +395,13 @@ class TestMessages:
     async def test_send_message_to_address(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
-        route = mock_api.post(f"{API}/chat/new").mock(return_value=ok_json({"guid": "new-chat"}))
+        route = mock_api.post(f"{API}/chat/new").mock(
+            return_value=ok_json({"guid": "new-chat"})
+        )
         result = await client.send_message_to_address("+15551234567", "Hey")
         assert result == {"guid": "new-chat"}
         import json
+
         body = json.loads(route.calls[0].request.content)
         assert body["addresses"] == ["+15551234567"]
         assert body["message"] == "Hey"
@@ -372,6 +415,7 @@ class TestMessages:
         route = mock_api.post(f"{API}/message/react").mock(return_value=ok_json(None))
         await client.send_reaction("g1", "msg-guid", "love", part_index=2)
         import json
+
         body = json.loads(route.calls[0].request.content)
         assert body == {
             "chatGuid": "g1",
@@ -386,6 +430,7 @@ class TestMessages:
         route = mock_api.post(f"{API}/message/m1/edit").mock(return_value=ok_json(None))
         await client.edit_message("m1", "new text")
         import json
+
         body = json.loads(route.calls[0].request.content)
         assert body["editedMessage"] == "new text"
         assert body["backwardsCompatibilityMessage"] == "Edited to: new text"
@@ -397,6 +442,7 @@ class TestMessages:
         route = mock_api.post(f"{API}/message/m1/edit").mock(return_value=ok_json(None))
         await client.edit_message("m1", "new", backwards_compat="custom", part_index=1)
         import json
+
         body = json.loads(route.calls[0].request.content)
         assert body["backwardsCompatibilityMessage"] == "custom"
         assert body["partIndex"] == 1
@@ -404,9 +450,12 @@ class TestMessages:
     async def test_unsend_message(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
-        route = mock_api.post(f"{API}/message/m1/unsend").mock(return_value=ok_json(None))
+        route = mock_api.post(f"{API}/message/m1/unsend").mock(
+            return_value=ok_json(None)
+        )
         await client.unsend_message("m1", part_index=3)
         import json
+
         assert json.loads(route.calls[0].request.content) == {"partIndex": 3}
 
     async def test_search_messages_defaults(
@@ -415,6 +464,7 @@ class TestMessages:
         route = mock_api.post(f"{API}/message/query").mock(return_value=ok_json([]))
         await client.search_messages()
         import json
+
         body = json.loads(route.calls[0].request.content)
         assert body["limit"] == 25
         assert body["offset"] == 0
@@ -429,6 +479,7 @@ class TestMessages:
         route = mock_api.post(f"{API}/message/query").mock(return_value=ok_json([]))
         await client.search_messages(query="hello", chat_guid="g1", after=10, before=20)
         import json
+
         body = json.loads(route.calls[0].request.content)
         assert body["chatGuid"] == "g1"
         assert body["after"] == 10
@@ -450,6 +501,7 @@ class TestMessages:
 # Contacts
 # ===========================================================================
 
+
 class TestContacts:
     async def test_get_contacts(
         self, client: BlueBubblesClient, mock_api: respx.Router
@@ -464,12 +516,16 @@ class TestContacts:
         route = mock_api.post(f"{API}/contact/query").mock(return_value=ok_json([]))
         await client.query_contacts(["+15551234567"])
         import json
-        assert json.loads(route.calls[0].request.content) == {"addresses": ["+15551234567"]}
+
+        assert json.loads(route.calls[0].request.content) == {
+            "addresses": ["+15551234567"]
+        }
 
 
 # ===========================================================================
 # Handle availability
 # ===========================================================================
+
 
 class TestHandles:
     async def test_imessage_availability(
@@ -496,6 +552,7 @@ class TestHandles:
 # ===========================================================================
 # Attachments
 # ===========================================================================
+
 
 class TestAttachments:
     async def test_get_attachment(
@@ -532,6 +589,7 @@ class TestAttachments:
 # Scheduled messages
 # ===========================================================================
 
+
 class TestScheduledMessages:
     async def test_list_scheduled_messages(
         self, client: BlueBubblesClient, mock_api: respx.Router
@@ -549,6 +607,7 @@ class TestScheduledMessages:
         result = await client.create_scheduled_message("g1", "Hello later", 1700000000)
         assert result == {"id": 42}
         import json
+
         body = json.loads(route.calls[0].request.content)
         assert body["chatGuid"] == "g1"
         assert body["message"] == "Hello later"
@@ -565,6 +624,7 @@ class TestScheduledMessages:
 # ===========================================================================
 # BlueBubblesError
 # ===========================================================================
+
 
 class TestBlueBubblesError:
     def test_message(self) -> None:

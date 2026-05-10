@@ -1,0 +1,18 @@
+pre-commit:
+  commands:
+    fmt:
+      glob: "*.py"
+      run: uv run --extra dev ruff format {staged_files}
+      stage_fixed: true
+    lint:
+      glob: "*.py"
+      run: uv run --extra dev ruff check --fix {staged_files}
+      stage_fixed: true
+
+pre-push:
+  commands:
+    typecheck:
+      glob: "*.py"
+      run: uv run --extra dev mypy src/
+    test:
+      run: uv run --extra dev pytest tests/ -v
