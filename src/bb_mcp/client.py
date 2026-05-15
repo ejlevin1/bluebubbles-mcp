@@ -177,6 +177,8 @@ class BlueBubblesClient:
         subject: str | None = None,
         reply_to_guid: str | None = None,
     ) -> dict[str, Any]:
+        if method == "apple-script":
+            chat_guid = chat_guid.replace("iMessage;-;", "any;-;", 1)
         body: dict[str, Any] = {
             "chatGuid": chat_guid,
             "tempGuid": f"temp-{uuid.uuid4().hex}",
