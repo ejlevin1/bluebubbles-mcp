@@ -10,7 +10,10 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp.utilities.logging import get_logger
 from mcp.types import ToolAnnotations
+
+logger = get_logger(__name__)
 
 from bb_mcp.client import BlueBubblesClient
 
@@ -72,8 +75,16 @@ async def lifespan(server: FastMCP):
     client = BlueBubblesClient(url, password)
     info = await client.server_info()
     if not info.get("private_api"):
+        logger.warning(
+            "BlueBubbles Private API is not enabled (helper_connected=%s). "
+            "Disabling tools: %s",
+            info.get("helper_connected"),
+            ", ".join(PRIVATE_API_TOOLS),
+        )
         for tool_name in PRIVATE_API_TOOLS:
             server.remove_tool(tool_name)
+    else:
+        logger.info("BlueBubbles Private API is enabled — all tools available.")
     try:
         yield {"bb": client}
     finally:
