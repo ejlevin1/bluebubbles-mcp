@@ -173,7 +173,7 @@ class BlueBubblesClient:
         self,
         chat_guid: str,
         message: str,
-        method: str = "private-api",
+        method: str = "apple-script",
         subject: str | None = None,
         reply_to_guid: str | None = None,
     ) -> dict[str, Any]:
@@ -194,7 +194,7 @@ class BlueBubblesClient:
         address: str,
         message: str,
         service: str = "iMessage",
-        method: str = "private-api",
+        method: str = "apple-script",
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "addresses": [address],
@@ -316,7 +316,7 @@ class BlueBubblesClient:
         file_data: bytes,
         filename: str,
         mime_type: str = "application/octet-stream",
-        method: str = "private-api",
+        method: str = "apple-script",
     ) -> dict[str, Any]:
         resp = await self._http.post(
             self._url("/message/attachment"),
