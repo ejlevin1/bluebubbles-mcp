@@ -185,7 +185,7 @@ class BlueBubblesClient:
         }
         if subject:
             body["subject"] = subject
-        if reply_to_guid:
+        if reply_to_guid and method != "apple-script":
             body["selectedMessageGuid"] = reply_to_guid
         return await self._post("/message/text", json=body)
 
