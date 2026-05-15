@@ -51,6 +51,16 @@ DESTRUCTIVE = ToolAnnotations(
 # ---------------------------------------------------------------------------
 
 
+PRIVATE_API_TOOLS = [
+    "send_reaction",
+    "edit_message",
+    "unsend_message",
+    "start_typing",
+    "stop_typing",
+    "send_attachment",
+]
+
+
 @asynccontextmanager
 async def lifespan(server: FastMCP):
     url = os.environ.get("BLUEBUBBLES_URL")
@@ -60,6 +70,10 @@ async def lifespan(server: FastMCP):
             "BLUEBUBBLES_URL and BLUEBUBBLES_PASSWORD environment variables are required"
         )
     client = BlueBubblesClient(url, password)
+    info = await client.server_info()
+    if not info.get("private_api"):
+        for tool_name in PRIVATE_API_TOOLS:
+            server.remove_tool(tool_name)
     try:
         yield {"bb": client}
     finally:
