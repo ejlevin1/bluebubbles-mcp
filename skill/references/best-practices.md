@@ -44,6 +44,19 @@ memory://tools/bluebubbles/group-chats.md
 
 Content: list of display names → chat GUIDs so you don't need to `list_chats` each time.
 
+### Resolve ALL participants, not just the sender
+
+When you fetch a chat, resolve every participant address — not only whoever last messaged:
+
+```
+get_chat(chat_guid)
+  → participants[].address  (all members)
+  → filter against memory://user/relationships/
+  → lookup_contact([remaining unknown addresses])  ← one batch call
+```
+
+This is mandatory for group chats. Never display a participant list with raw phone numbers or GUIDs.
+
 ### Batch lookup reminder
 
 `lookup_contact` accepts a list — always batch. Never call once per address:
@@ -53,6 +66,16 @@ lookup_contact(addresses=["+15551234567", "+15559876543", "bob@example.com"])
 ```
 
 If no match found, fall back to formatted phone/email — never show a raw GUID.
+
+### If `lookup_contact` is not in the active tool set
+
+Load it via ToolCatalog before giving up:
+
+```
+ToolCatalog(load=true, task_description="bluebubbles lookup contact resolve phone number")
+```
+
+ToolCatalog enables matching tools and returns their names in `enabledTools`. Once loaded, proceed with the normal batch-lookup. Never skip contact resolution because the tool wasn't pre-loaded.
 
 ## Unread Chats
 

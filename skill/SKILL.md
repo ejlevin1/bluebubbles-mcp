@@ -32,6 +32,29 @@ Store meaningful new contacts to memory
 Present with human names
 ```
 
+### Resolving all conversation participants
+
+When entering or displaying any chat, **always** resolve every participant — not just the message sender:
+
+```
+get_chat(chat_guid)                              → fetch full participant list
+List(memory://user/relationships/)               → filter out already-known addresses
+lookup_contact([all unknown participant addrs])  → one batch call for the rest
+Present participant names, never raw addresses
+```
+
+Never skip this step for group chats — all members must be named before the conversation is shown.
+
+### If `lookup_contact` is not directly available
+
+If `lookup_contact` is not in your active tool set, load it via ToolCatalog before proceeding:
+
+```
+ToolCatalog(load=true, task_description="bluebubbles lookup contact resolve phone number")
+```
+
+This enables any matching tools returned in `enabledTools`. After loading, proceed with the normal batch-lookup flow. **Do not skip resolution or fall back to raw addresses** because the tool wasn't pre-loaded — always attempt to load it first.
+
 For memory format, storage criteria, and group chat mappings — see [references/best-practices.md](references/best-practices.md).
 
 ## Core Workflows
