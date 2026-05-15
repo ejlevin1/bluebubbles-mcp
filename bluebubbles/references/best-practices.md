@@ -101,6 +101,34 @@ Before adding/removing participants:
 2. Present current list to user
 3. Confirm the change
 
+## Sending Messages — Private API vs AppleScript
+
+BlueBubbles has two send methods. The server in use here runs **AppleScript only** — the Private API is not enabled.
+
+### What works with AppleScript
+
+- `send_message` — basic text send to an existing chat GUID
+- `send_message_to_address` — basic text send to a phone number or email
+
+### What requires Private API (not available — will 500)
+
+- Threaded replies (`reply_to_guid`)
+- `send_reaction` — tapbacks
+- `edit_message` — editing
+- `unsend_message` — retraction
+- `start_typing` / `stop_typing` — typing indicators
+- `send_attachment` — file/photo/video sends
+
+### If a send fails with a 500 error
+
+1. **Do not retry** — it will fail again the same way
+2. Tell the user the feature requires the Private API, which is not currently enabled on the server
+3. Offer to send a plain text version if a threaded reply or reaction was intended
+
+### chat_guid format for sends
+
+AppleScript requires the `any;-;<address>` GUID format for 1:1 chats. The `iMessage;-;<address>` prefix will cause the server to hang. The MCP client normalizes this automatically, but if constructing GUIDs manually always use `any;-;`.
+
 ## iMessage-Only Features
 
 These fail silently on SMS threads:

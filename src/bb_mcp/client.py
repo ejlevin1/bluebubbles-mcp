@@ -198,6 +198,10 @@ class BlueBubblesClient:
         service: str = "iMessage",
         method: str = "apple-script",
     ) -> dict[str, Any]:
+        if method == "apple-script":
+            # /chat/new requires Private API; use /message/text with the
+            # canonical any;-;<address> GUID for 1:1 chats instead.
+            return await self.send_message(f"any;-;{address}", message, method=method)
         body: dict[str, Any] = {
             "addresses": [address],
             "message": message,
