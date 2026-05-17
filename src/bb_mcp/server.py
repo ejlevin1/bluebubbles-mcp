@@ -61,6 +61,8 @@ PRIVATE_API_TOOLS = [
     "start_typing",
     "stop_typing",
     "send_attachment",
+    "check_imessage",
+    "check_facetime",
 ]
 
 

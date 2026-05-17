@@ -41,8 +41,6 @@ ALWAYS_PRESENT = [
     "mark_chat_unread",
     "get_contacts",
     "lookup_contact",
-    "check_imessage",
-    "check_facetime",
     "rename_group",
     "add_participant",
     "remove_participant",
@@ -61,6 +59,8 @@ PRIVATE_API_ONLY = [
     "start_typing",
     "stop_typing",
     "send_attachment",
+    "check_imessage",
+    "check_facetime",
 ]
 
 
