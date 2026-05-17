@@ -1,4 +1,5 @@
 #!/bin/sh
 set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 exec uv run --no-cache --env-file "$SCRIPT_DIR/.env" bb-mcp
