@@ -33,6 +33,11 @@ smoke-uvx:
 smoke-docker:
     uv run scripts/smoke_docker.py
 
+# Validate MCP tool list matches server capabilities; optionally send a test message
+# Usage: just validate-tools [+15551234567]
+validate-tools phone="":
+    uv run scripts/validate_tools.py {{ if phone != "" { "--send-message " + phone } else { "" } }}
+
 # Lint with ruff
 lint:
     uv run --extra dev ruff check src/ tests/

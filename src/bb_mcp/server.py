@@ -86,7 +86,7 @@ async def lifespan(server: FastMCP):
     else:
         logger.info("BlueBubbles Private API is enabled — all tools available.")
     try:
-        yield {"bb": client}
+        yield {"bb": client, "private_api": bool(info.get("private_api"))}
     finally:
         await client.close()
 
@@ -113,6 +113,10 @@ mcp = FastMCP(
 
 def _bb(ctx: Context) -> BlueBubblesClient:
     return ctx.request_context.lifespan_context["bb"]
+
+
+def _private_api(ctx: Context) -> bool:
+    return ctx.request_context.lifespan_context["private_api"]
 
 
 def _fmt(data: Any) -> str:
@@ -353,6 +357,8 @@ async def send_message(
         message: The message text.
         reply_to_guid: Optional message GUID to reply to (creates a thread).
     """
+    if reply_to_guid and not _private_api(ctx):
+        raise ValueError("Threaded replies require the BlueBubbles Private API, which is not enabled on this server.")
     data = await _bb(ctx).send_message(chat_guid, message, reply_to_guid=reply_to_guid)
     return _fmt(data)
 
@@ -374,6 +380,8 @@ async def send_message_to_address(
         message: The message text.
         service: 'iMessage' or 'SMS' (default iMessage).
     """
+    if service.upper() == "SMS" and not _private_api(ctx):
+        raise ValueError("SMS service requires the BlueBubbles Private API, which is not enabled on this server.")
     data = await _bb(ctx).send_message_to_address(address, message, service=service)
     return _fmt(data)
 
