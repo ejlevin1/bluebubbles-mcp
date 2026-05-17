@@ -11,9 +11,15 @@ Full access to the user's Apple iMessage and SMS via the BlueBubbles MCP server.
 
 1. **All sends are real.** Messages are immediately delivered and visible. If intent is ambiguous ("draft a reply"), show the text and confirm before sending.
 2. **Always resolve contacts.** Never show raw GUIDs or phone numbers to the user. Use memory first, then `lookup_contact` for unknowns. See [Contact Resolution](#contact-resolution).
-3. **Confirm destructive actions.** Always ask before: `unsend_message`, `delete_chat`, `remove_participant`, `leave_chat`.
-4. **iMessage vs SMS awareness.** Reactions, edit, unsend, and typing indicators only work on iMessage (blue bubble) threads — they silently fail on SMS.
-5. **Check memory first.** Before any messaging task, check `memory://tools/bluebubbles/` for tool patterns and `memory://user/relationships/` for known contacts.
+3. **Always normalize phone numbers to E.164 format** before passing to any tool. Strip formatting, assume US (+1) if no country code given.
+   - `555-555-1234` → `+15555551234`
+   - `(555) 555-1234` → `+15555551234`
+   - `+44 7911 123456` → `+447911123456`
+   Never pass a raw unformatted number to a tool.
+4. **Confirm destructive actions.** Always ask before: `unsend_message`, `delete_chat`, `remove_participant`, `leave_chat`.
+5. **Private API tools may not be available.** `send_reaction`, `edit_message`, `unsend_message`, `start_typing`, `stop_typing`, `send_attachment`, `check_imessage`, and `check_facetime` all require the BlueBubbles Private API. If they are absent from the tool list, the server does not support them — tell the user rather than attempting to call them.
+6. **iMessage vs SMS awareness.** Reactions, edit, unsend, and typing indicators only work on iMessage threads AND require Private API. SMS only supports basic send.
+7. **Check memory first.** Before any messaging task, check `memory://tools/bluebubbles/` for tool patterns and `memory://user/relationships/` for known contacts.
 
 ## Contact Resolution
 
@@ -70,11 +76,13 @@ Present summary → offer reply or mark_chat_read
 
 ### Send a text
 ```
-Read(memory://user/relationships/<name>.md)      → get address + iMessage status from memory
-  OR lookup_contact + check_imessage             → if not in memory
+Read(memory://user/relationships/<name>.md)      → get address from memory
+  OR lookup_contact                              → if not in memory
 send_message(chat_guid, text)                    → existing thread
 send_message_to_address(address, text, service)  → new thread
 ```
+Note: `check_imessage` requires Private API. If unavailable, default to iMessage service
+and inform the user if the send fails that the address may not support iMessage.
 
 ### Search history
 ```
@@ -87,6 +95,27 @@ Time filters use **epoch milliseconds**.
 ```
 send_attachment(chat_guid, data_base64, filename, mime_type)
 ```
+Requires Private API. If `send_attachment` is not in the tool list, tell the user
+attachment sending is not supported on this server.
+
+### Schedule a message
+```
+schedule_message(chat_guid, message, scheduled_for)   → scheduled_for is epoch milliseconds
+list_scheduled_messages                               → see pending scheduled messages
+delete_scheduled_message(id)                          → cancel a scheduled message
+```
+
+## chat_guid Format
+
+GUIDs identify conversations. The format encodes the chat type:
+
+| Format | Meaning |
+|--------|---------|
+| `any;-;+15551234567` | 1:1 direct message with a phone number |
+| `any;-;user@example.com` | 1:1 direct message with an email |
+| `any;+;chat<hash>` | Group chat |
+
+**Never construct GUIDs manually for group chats** — always look them up via `list_chats` or `get_chat`. For 1:1 chats, `any;-;<E.164 address>` is reliable. The `iMessage;-;` prefix is invalid for AppleScript sends — the MCP client normalizes this automatically.
 
 ## Decision Tree
 
@@ -99,8 +128,9 @@ User wants to check messages?
 
 Sending to a new address?
   → Check memory://user/relationships/ for known address
-  → If not in memory: check_imessage to determine service
-  → Inform user if falling back to SMS (green bubble)
+  → If not in memory: lookup_contact to resolve name
+  → If check_imessage is available: use it to determine service
+  → If check_imessage is NOT available: default to iMessage, inform user if send fails
   → After sending: store contact if relationship is meaningful
 
 User mentions a contact by name?
@@ -110,12 +140,19 @@ User mentions a contact by name?
   → Never guess phone numbers
 
 User wants to react/edit/unsend?
-  → Verify thread is iMessage, not SMS
+  → Check if send_reaction/edit_message/unsend_message is in the tool list
+  → If NOT available: tell user these features require Private API, not enabled on this server
+  → If available: verify thread is iMessage, not SMS
   → Confirm before unsend (irreversible)
 
 User references a group chat by name?
   → Check memory://tools/bluebubbles/group-chats.md
   → If not in memory: list_chats to find, then store the mapping
+
+User wants to schedule a message?
+  → Normalize address to E.164, convert delivery time to epoch milliseconds
+  → schedule_message(chat_guid, message, scheduled_for)
+  → Confirm scheduled time back to user
 ```
 
 ## Memory

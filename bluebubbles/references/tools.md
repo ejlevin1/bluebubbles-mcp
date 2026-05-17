@@ -1,5 +1,25 @@
 # BlueBubbles Tool Reference
 
+## Private API Availability
+
+Some tools require the BlueBubbles Private API (a helper bundle installed on the Mac).
+**If Private API is not enabled, these tools will not appear in the tool list at all** —
+do not attempt to call them or suggest them to the user.
+
+| Tool | Requires Private API |
+|------|---------------------|
+| `send_reaction` | ✅ |
+| `edit_message` | ✅ |
+| `unsend_message` | ✅ |
+| `start_typing` | ✅ |
+| `stop_typing` | ✅ |
+| `send_attachment` | ✅ |
+| `check_imessage` | ✅ |
+| `check_facetime` | ✅ |
+
+If a user asks for one of these features and the tool is unavailable, tell them it requires
+the BlueBubbles Private API which is not enabled on their server.
+
 ## Reading
 
 | Tool | Purpose |
@@ -17,11 +37,11 @@
 | Tool | Purpose |
 |------|---------|
 | `send_message` | Send to an existing chat by GUID |
-| `send_message_to_address` | Send to a phone number or email; set `service` to `"iMessage"` or `"SMS"`; creates chat if needed |
-| `send_attachment` | Send a photo, video, or file; `data_base64` is base64-encoded file content |
-| `send_reaction` | Tapback: `love`, `like`, `dislike`, `laugh`, `emphasize`, `question`; prefix with `-` to remove |
-| `edit_message` | Edit a sent iMessage (iMessage only, not SMS) |
-| `unsend_message` | Retract a sent iMessage — irreversible, confirm first |
+| `send_message_to_address` | Send to a phone number or email; `service` defaults to `"iMessage"` (`"SMS"` requires Private API) |
+| `send_attachment` | ⚠️ Private API — Send a photo, video, or file; `data_base64` is base64-encoded file content |
+| `send_reaction` | ⚠️ Private API — Tapback: `love`, `like`, `dislike`, `laugh`, `emphasize`, `question`; prefix with `-` to remove |
+| `edit_message` | ⚠️ Private API — Edit a sent iMessage (iMessage only, not SMS) |
+| `unsend_message` | ⚠️ Private API — Retract a sent iMessage — irreversible, confirm first |
 | `schedule_message` | Queue for future delivery; `scheduled_for` is epoch milliseconds |
 
 ## Contacts
@@ -29,9 +49,9 @@
 | Tool | Purpose |
 |------|---------|
 | `get_contacts` | Full address book with names, phone numbers, emails |
-| `lookup_contact` | Resolve one or more phone numbers / emails to contact names |
-| `check_imessage` | Check whether an address supports iMessage (blue bubble vs green) |
-| `check_facetime` | Check whether an address supports FaceTime |
+| `lookup_contact` | Resolve one or more phone numbers / emails to contact names — returns only address book matches; unrecognized numbers are silently omitted, fall back to formatted phone |
+| `check_imessage` | ⚠️ Private API — Check whether an address supports iMessage (blue bubble vs green) |
+| `check_facetime` | ⚠️ Private API — Check whether an address supports FaceTime |
 
 ## Group Chats
 
@@ -48,8 +68,8 @@
 |------|---------|
 | `mark_chat_read` | Send read receipt (visible to other person) |
 | `mark_chat_unread` | Mark as unread locally |
-| `start_typing` | Show typing indicator to other person |
-| `stop_typing` | Stop typing indicator |
+| `start_typing` | ⚠️ Private API — Show typing indicator to other person |
+| `stop_typing` | ⚠️ Private API — Stop typing indicator |
 
 ## Scheduled Messages
 

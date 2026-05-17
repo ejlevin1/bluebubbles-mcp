@@ -27,7 +27,7 @@ Example: `memory://user/relationships/john-smith.md`
 ## Contact Info
 - Phone: +15551234567
 - Email: john@example.com
-- iMessage: yes
+- iMessage: yes  ← omit or set "unknown" if check_imessage is not available
 
 ## Context
 - <relationship: colleague, friend, family, etc.>
@@ -103,26 +103,30 @@ Before adding/removing participants:
 
 ## Sending Messages — Private API vs AppleScript
 
-BlueBubbles has two send methods. The server in use here runs **AppleScript only** — the Private API is not enabled.
+BlueBubbles has two send methods: **Private API** (requires a helper bundle) and **AppleScript** (always available). Check `get_server_info` → `private_api` to know which is active, or simply check whether Private API tools appear in the tool list.
 
-### What works with AppleScript
+### What always works (AppleScript)
 
 - `send_message` — basic text send to an existing chat GUID
 - `send_message_to_address` — basic text send to a phone number or email
+- `schedule_message` — schedule future delivery
 
-### What requires Private API (not available — will 500)
+### What requires Private API
 
-- Threaded replies (`reply_to_guid`)
+- Threaded replies (`reply_to_guid` on `send_message`)
 - `send_reaction` — tapbacks
 - `edit_message` — editing
 - `unsend_message` — retraction
 - `start_typing` / `stop_typing` — typing indicators
 - `send_attachment` — file/photo/video sends
+- `check_imessage` / `check_facetime` — availability checks
+
+These tools are **automatically removed from the tool list** when Private API is not enabled. If they are absent, the server does not support them.
 
 ### If a send fails with a 500 error
 
 1. **Do not retry** — it will fail again the same way
-2. Tell the user the feature requires the Private API, which is not currently enabled on the server
+2. Tell the user the feature requires the Private API, which is not enabled on this server
 3. Offer to send a plain text version if a threaded reply or reaction was intended
 
 ### chat_guid format for sends
@@ -131,13 +135,14 @@ AppleScript requires the `any;-;<address>` GUID format for 1:1 chats. The `iMess
 
 ## iMessage-Only Features
 
-These fail silently on SMS threads:
+These fail silently on SMS threads AND require Private API:
 - `send_reaction` — tapbacks
 - `edit_message` — editing
 - `unsend_message` — retraction
 - `start_typing` / `stop_typing` — indicators
 
-If unsure whether a thread is iMessage: `check_imessage(address)`.
+If unsure whether a thread is iMessage and `check_imessage` is available: call it to verify.
+If `check_imessage` is not in the tool list (Private API disabled): assume iMessage for blue-bubble contacts and SMS for others, or ask the user.
 
 ## Destructive Actions — Always Confirm
 
