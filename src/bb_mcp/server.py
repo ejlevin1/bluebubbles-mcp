@@ -876,7 +876,7 @@ def main(
         "Defaults to the address reported by the BlueBubbles server.",
     ),
 ) -> None:
-    mcp.mask_error_details = mask_errors
+    mcp.mask_error_details = mask_errors  # type: ignore[attr-defined]
     mcp._my_address_override = my_address  # type: ignore[attr-defined]
     mcp.run(transport="stdio")
 
