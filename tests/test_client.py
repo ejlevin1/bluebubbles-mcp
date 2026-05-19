@@ -355,7 +355,7 @@ class TestMessages:
         body = json.loads(route.calls[0].request.content)
         assert body["chatGuid"] == "g1"
         assert body["message"] == "Hello!"
-        assert body["method"] == "private-api"
+        assert body["method"] == "apple-script"
         assert body["tempGuid"].startswith("temp-")
         assert "subject" not in body
         assert "selectedMessageGuid" not in body
@@ -367,15 +367,16 @@ class TestMessages:
         await client.send_message(
             "g1",
             "Hi",
-            method="apple-script",
+            method="private-api",
             subject="Subj",
             reply_to_guid="reply-guid",
         )
         import json
 
         body = json.loads(route.calls[0].request.content)
-        assert body["method"] == "apple-script"
+        assert body["method"] == "private-api"
         assert body["subject"] == "Subj"
+        # selectedMessageGuid only sent for non-apple-script methods
         assert body["selectedMessageGuid"] == "reply-guid"
 
     async def test_send_message_unique_temp_guids(
@@ -395,10 +396,30 @@ class TestMessages:
     async def test_send_message_to_address(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
+        # Default method is apple-script: routes through /message/text with any;-;<address> GUID
+        route = mock_api.post(f"{API}/message/text").mock(
+            return_value=ok_json({"guid": "m1"})
+        )
+        result = await client.send_message_to_address("+15551234567", "Hey")
+        assert result == {"guid": "m1"}
+        import json
+
+        body = json.loads(route.calls[0].request.content)
+        assert body["chatGuid"] == "any;-;+15551234567"
+        assert body["message"] == "Hey"
+        assert body["method"] == "apple-script"
+        assert body["tempGuid"].startswith("temp-")
+
+    async def test_send_message_to_address_private_api(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        # Private-api method: routes through /chat/new with addresses list
         route = mock_api.post(f"{API}/chat/new").mock(
             return_value=ok_json({"guid": "new-chat"})
         )
-        result = await client.send_message_to_address("+15551234567", "Hey")
+        result = await client.send_message_to_address(
+            "+15551234567", "Hey", method="private-api"
+        )
         assert result == {"guid": "new-chat"}
         import json
 
