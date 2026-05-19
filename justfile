@@ -38,6 +38,11 @@ smoke-docker:
 validate-tools phone="":
     uv run scripts/validate_tools.py {{ if phone != "" { "--send-message " + phone } else { "" } }}
 
+# Run end-to-end tests against the live server (read-only by default)
+# Pass --send to also send real messages: just e2e --send
+e2e *args="--no-send":
+    uv run scripts/e2e_test.py {{ args }}
+
 # Lint with ruff
 lint:
     uv run --extra dev ruff check src/ tests/

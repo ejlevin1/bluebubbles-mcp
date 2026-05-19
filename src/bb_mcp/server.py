@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
-import json
 import os
 import time
 from contextlib import asynccontextmanager
 from typing import Any
 
-from mcp.server.fastmcp import Context, FastMCP
-from mcp.server.fastmcp.utilities.logging import get_logger
+import typer
+from fastmcp import Context, FastMCP
+from fastmcp.utilities.logging import get_logger
+from fastmcp.utilities.types import Image
 from mcp.types import ToolAnnotations
 
-logger = get_logger(__name__)
-
 from bb_mcp.client import BlueBubblesClient
+
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Annotations
@@ -32,7 +34,7 @@ IDEMPOTENT_WRITE = ToolAnnotations(
     readOnlyHint=False,
     destructiveHint=False,
     idempotentHint=True,
-    openWorldHint=False,
+    openWorldHint=True,
 )
 
 SEND = ToolAnnotations(
@@ -84,11 +86,27 @@ async def lifespan(server: FastMCP):
             ", ".join(PRIVATE_API_TOOLS),
         )
         for tool_name in PRIVATE_API_TOOLS:
-            server.remove_tool(tool_name)
+            try:
+                server.local_provider.remove_tool(tool_name)
+            except KeyError:
+                pass  # already removed (e.g. second lifespan run in tests)
+        # Strip reply_to_guid from send_message — it requires Private API
+        send_msg_tool = await server.local_provider.get_tool("send_message")
+        if send_msg_tool:
+            send_msg_tool.parameters.get("properties", {}).pop("reply_to_guid", None)
+            required = send_msg_tool.parameters.get("required", [])
+            if "reply_to_guid" in required:
+                required.remove("reply_to_guid")
     else:
         logger.info("BlueBubbles Private API is enabled — all tools available.")
+    override = getattr(server, "_my_address_override", None)
+    me = override or info.get("detected_imessage") or info.get("detected_icloud")
     try:
-        yield {"bb": client, "private_api": bool(info.get("private_api"))}
+        yield {
+            "bb": client,
+            "private_api": bool(info.get("private_api")),
+            "me": me,
+        }
     finally:
         await client.close()
 
@@ -114,16 +132,66 @@ mcp = FastMCP(
 
 
 def _bb(ctx: Context) -> BlueBubblesClient:
-    return ctx.request_context.lifespan_context["bb"]
+    return ctx.lifespan_context["bb"]
 
 
 def _private_api(ctx: Context) -> bool:
-    return ctx.request_context.lifespan_context["private_api"]
+    return ctx.lifespan_context["private_api"]
 
 
-def _fmt(data: Any) -> str:
-    """Format API response data as readable JSON."""
-    return json.dumps(data, indent=2, default=str, ensure_ascii=False)
+def _resolve_address(ctx: Context, address: str) -> str:
+    """Translate 'me' to the server's detected iMessage address."""
+    if address.lower() == "me":
+        me = ctx.lifespan_context.get("me")
+        if not me:
+            raise ValueError(
+                "Cannot resolve 'me': server did not return a detected_imessage address."
+            )
+        return me
+    return address
+
+
+# ---------------------------------------------------------------------------
+# Message projection
+# ---------------------------------------------------------------------------
+
+_SLIM_MSG_FIELDS = frozenset(
+    {
+        "guid",
+        "text",
+        "handle",
+        "isFromMe",
+        "dateCreated",
+        "attachments",
+        "replyToGuid",
+        "associatedMessageGuid",
+        "associatedMessageType",
+        "dateEdited",
+        "dateRetracted",
+        "isAudioMessage",
+        "chats",
+        "error",
+    }
+)
+_SLIM_HANDLE_FIELDS = frozenset({"address", "service"})
+_SLIM_CHAT_FIELDS = frozenset({"guid", "displayName", "isArchived"})
+
+
+def _slim_message(msg: dict[str, Any]) -> dict[str, Any]:
+    out = {k: v for k, v in msg.items() if k in _SLIM_MSG_FIELDS}
+    if isinstance(out.get("handle"), dict):
+        out["handle"] = {
+            k: v for k, v in out["handle"].items() if k in _SLIM_HANDLE_FIELDS
+        }
+    if isinstance(out.get("chats"), list):
+        out["chats"] = [
+            {k: v for k, v in c.items() if k in _SLIM_CHAT_FIELDS} for c in out["chats"]
+        ]
+    return out
+
+
+def _project(data: list[dict[str, Any]], extended: bool) -> list[dict[str, Any]]:
+    return data if extended else [_slim_message(m) for m in data]
 
 
 # ---------------------------------------------------------------------------
@@ -132,23 +200,38 @@ def _fmt(data: Any) -> str:
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_server_info(ctx: Context) -> str:
+async def get_my_address(ctx: Context) -> str:
+    """Get the iMessage address (email or phone number) for the user who owns this device.
+
+    Returns the address that identifies the local user — useful for filtering
+    messages sent by the user (pass this value as from_address in search/fetch tools).
+    Returns the BLUEBUBBLES_MY_ADDRESS override if set, otherwise the address
+    detected from the BlueBubbles server.
+    """
+    me = ctx.lifespan_context.get("me")
+    if not me:
+        raise ValueError(
+            "Could not determine user address: server did not return detected_imessage."
+        )
+    return me
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_server_info(ctx: Context) -> dict[str, Any]:
     """Get BlueBubbles server info and health status.
 
     Returns version, OS, and configuration details for the BlueBubbles iMessage/SMS bridge server.
     """
-    data = await _bb(ctx).server_info()
-    return _fmt(data)
+    return await _bb(ctx).server_info()
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def ping(ctx: Context) -> str:
+async def ping(ctx: Context) -> Any:
     """Ping the BlueBubbles server to check connectivity.
 
     Verifies the iMessage/SMS bridge is reachable and responding.
     """
-    data = await _bb(ctx).ping()
-    return _fmt(data)
+    return await _bb(ctx).ping()
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +244,7 @@ async def list_chats(
     ctx: Context,
     limit: int = 25,
     offset: int = 0,
-) -> str:
+) -> list[dict[str, Any]]:
     """List iMessage and SMS text message conversations, sorted by most recent activity.
 
     Returns Apple iMessage and SMS chat threads from the bridged iPhone/Mac, including
@@ -171,14 +254,13 @@ async def list_chats(
         limit: Max number of chats to return (default 25).
         offset: Pagination offset.
     """
-    data = await _bb(ctx).list_chats(
+    return await _bb(ctx).list_chats(
         limit=limit, offset=offset, with_fields=["lastmessage"]
     )
-    return _fmt(data)
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_chat(ctx: Context, chat_guid: str) -> str:
+async def get_chat(ctx: Context, chat_guid: str) -> dict[str, Any]:
     """Get details for a specific iMessage or SMS chat, including participants.
 
     Returns full chat metadata, participant phone numbers or emails, and the last message
@@ -187,10 +269,9 @@ async def get_chat(ctx: Context, chat_guid: str) -> str:
     Args:
         chat_guid: The chat GUID (e.g. 'iMessage;-;+15551234567' or 'iMessage;+;chat123').
     """
-    data = await _bb(ctx).get_chat(
+    return await _bb(ctx).get_chat(
         chat_guid, with_fields=["participants", "lastmessage"]
     )
-    return _fmt(data)
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -202,7 +283,9 @@ async def get_chat_messages(
     sort: str = "DESC",
     after: int | None = None,
     before: int | None = None,
-) -> str:
+    from_address: str | None = None,
+    extended: bool = False,
+) -> list[dict[str, Any]]:
     """Get iMessage or SMS text messages from a specific chat conversation.
 
     Retrieves the message history for an Apple iMessage or SMS thread, with optional
@@ -215,11 +298,26 @@ async def get_chat_messages(
         sort: 'ASC' or 'DESC' (default DESC = newest first).
         after: Only messages after this epoch-ms timestamp.
         before: Only messages before this epoch-ms timestamp.
+        from_address: Only return messages from this sender. Pass an E.164 phone
+                      number or email (e.g. '+15551234567'), or the special value
+                      'me' to filter to messages sent by the user. Filters client-side
+                      after fetch.
+        extended: KEEP FALSE. Only set True if you have verified the compact
+                  subset is missing a field you need AND get_message(guid,
+                  extended=True) cannot serve the specific message instead.
+                  Compact fields: guid, text, handle, isFromMe, dateCreated,
+                  attachments, replyToGuid, associatedMessageGuid/Type, chats, error.
     """
     data = await _bb(ctx).get_chat_messages(
-        chat_guid, limit=limit, offset=offset, sort=sort, after=after, before=before
+        chat_guid,
+        limit=limit,
+        offset=offset,
+        sort=sort,
+        after=after,
+        before=before,
+        handle_address=_resolve_address(ctx, from_address) if from_address else None,
     )
-    return _fmt(data)
+    return _project(data, extended)
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -227,7 +325,9 @@ async def get_recent_messages(
     ctx: Context,
     minutes: int = 60,
     limit: int = 50,
-) -> str:
+    from_address: str | None = None,
+    extended: bool = False,
+) -> list[dict[str, Any]]:
     """Get recent iMessage and SMS text messages across all conversations within a time window.
 
     Fetches the latest Apple iMessage and SMS messages received on the bridged iPhone/Mac
@@ -236,14 +336,28 @@ async def get_recent_messages(
     Args:
         minutes: How far back to look (default 60 minutes).
         limit: Max messages to return (default 50).
+        from_address: Only return messages from this sender. Pass an E.164 phone
+                      number or email (e.g. '+15551234567'), or 'me' to filter
+                      to messages sent by the user. Server-side filter.
+        extended: KEEP FALSE. Only set True if you have verified the compact
+                  subset is missing a field you need AND get_message(guid,
+                  extended=True) cannot serve the specific message instead.
     """
     after = int((time.time() - minutes * 60) * 1000)
-    data = await _bb(ctx).search_messages(after=after, limit=limit)
-    return _fmt(data)
+    data = await _bb(ctx).search_messages(
+        after=after,
+        limit=limit,
+        handle_address=_resolve_address(ctx, from_address) if from_address else None,
+    )
+    return _project(data, extended)
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_unread_chats(ctx: Context, message_limit: int = 5) -> str:
+async def get_unread_chats(
+    ctx: Context,
+    message_limit: int = 5,
+    extended: bool = False,
+) -> list[dict[str, Any]]:
     """Get all iMessage and SMS conversations with unread text messages.
 
     Returns Apple iMessage and SMS chats that have unread messages on the bridged
@@ -251,30 +365,23 @@ async def get_unread_chats(ctx: Context, message_limit: int = 5) -> str:
 
     Args:
         message_limit: Number of recent messages to include per unread chat (default 5).
+        extended: KEEP FALSE. Only set True if you have verified the compact
+                  subset is missing a field you need AND get_message(guid,
+                  extended=True) cannot serve the specific message instead.
     """
     bb = _bb(ctx)
     chats = await bb.list_chats(limit=100, with_fields=["lastmessage"])
     unread = [c for c in chats if c.get("hasUnreadMessages")]
-    results = []
-    for chat in unread:
+
+    async def fetch_chat_with_messages(chat: dict[str, Any]) -> dict[str, Any]:
         messages = await bb.get_chat_messages(chat["guid"], limit=message_limit)
-        results.append(
-            {
-                "chat": chat,
-                "recent_messages": messages,
-            }
-        )
-    return _fmt(results)
+        return {"chat": chat, "recent_messages": _project(messages, extended)}
+
+    results = await asyncio.gather(*[fetch_chat_with_messages(c) for c in unread])
+    return list(results)
 
 
-@mcp.tool(
-    annotations=ToolAnnotations(
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
-    )
-)
+@mcp.tool(annotations=IDEMPOTENT_WRITE)
 async def mark_chat_read(ctx: Context, chat_guid: str) -> str:
     """Mark an iMessage or SMS conversation as read, sending a read receipt.
 
@@ -348,21 +455,22 @@ async def send_message(
     chat_guid: str,
     message: str,
     reply_to_guid: str | None = None,
-) -> str:
+) -> dict[str, Any]:
     """Send an iMessage or SMS text message to an existing conversation.
 
     Sends an Apple iMessage or SMS text to the specified chat thread on the
-    bridged iPhone/Mac. Supports threaded replies.
+    bridged iPhone/Mac.
 
     Args:
         chat_guid: The chat GUID to send to.
         message: The message text.
-        reply_to_guid: Optional message GUID to reply to (creates a thread).
+        reply_to_guid: Message GUID to reply to, creating a thread.
     """
     if reply_to_guid and not _private_api(ctx):
-        raise ValueError("Threaded replies require the BlueBubbles Private API, which is not enabled on this server.")
-    data = await _bb(ctx).send_message(chat_guid, message, reply_to_guid=reply_to_guid)
-    return _fmt(data)
+        raise ValueError(
+            "Threaded replies require the BlueBubbles Private API, which is not enabled on this server."
+        )
+    return await _bb(ctx).send_message(chat_guid, message, reply_to_guid=reply_to_guid)
 
 
 @mcp.tool(annotations=SEND)
@@ -371,7 +479,7 @@ async def send_message_to_address(
     address: str,
     message: str,
     service: str = "iMessage",
-) -> str:
+) -> dict[str, Any]:
     """Send an iMessage or SMS text message to a phone number or email address.
 
     Sends an Apple iMessage or SMS text to a mobile phone number or email, creating
@@ -383,9 +491,10 @@ async def send_message_to_address(
         service: 'iMessage' or 'SMS' (default iMessage).
     """
     if service.upper() == "SMS" and not _private_api(ctx):
-        raise ValueError("SMS service requires the BlueBubbles Private API, which is not enabled on this server.")
-    data = await _bb(ctx).send_message_to_address(address, message, service=service)
-    return _fmt(data)
+        raise ValueError(
+            "SMS service requires the BlueBubbles Private API, which is not enabled on this server."
+        )
+    return await _bb(ctx).send_message_to_address(address, message, service=service)
 
 
 @mcp.tool(annotations=SEND)
@@ -394,7 +503,7 @@ async def send_reaction(
     chat_guid: str,
     message_guid: str,
     reaction: str,
-) -> str:
+) -> Any:
     """Send an Apple iMessage tapback reaction (like, love, laugh, etc.) to a text message.
 
     Sends an Apple iMessage tapback emoji reaction to a specific message in a chat.
@@ -406,8 +515,7 @@ async def send_reaction(
         reaction: One of: love, like, dislike, laugh, emphasize, question.
                   Prefix with '-' to remove (e.g. '-love').
     """
-    data = await _bb(ctx).send_reaction(chat_guid, message_guid, reaction)
-    return _fmt(data)
+    return await _bb(ctx).send_reaction(chat_guid, message_guid, reaction)
 
 
 @mcp.tool(annotations=SEND)
@@ -415,7 +523,7 @@ async def edit_message(
     ctx: Context,
     message_guid: str,
     new_text: str,
-) -> str:
+) -> Any:
     """Edit a previously sent iMessage text message.
 
     Edits an Apple iMessage that was already sent. Only works on iMessage (not SMS)
@@ -425,12 +533,11 @@ async def edit_message(
         message_guid: GUID of the iMessage to edit.
         new_text: The new message text.
     """
-    data = await _bb(ctx).edit_message(message_guid, new_text)
-    return _fmt(data)
+    return await _bb(ctx).edit_message(message_guid, new_text)
 
 
 @mcp.tool(annotations=DESTRUCTIVE)
-async def unsend_message(ctx: Context, message_guid: str) -> str:
+async def unsend_message(ctx: Context, message_guid: str) -> Any:
     """Unsend (retract) a previously sent iMessage text message.
 
     Retracts an Apple iMessage that was already sent, removing it for all participants.
@@ -439,8 +546,7 @@ async def unsend_message(ctx: Context, message_guid: str) -> str:
     Args:
         message_guid: GUID of the iMessage to unsend.
     """
-    data = await _bb(ctx).unsend_message(message_guid)
-    return _fmt(data)
+    return await _bb(ctx).unsend_message(message_guid)
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -452,7 +558,9 @@ async def search_messages(
     offset: int = 0,
     after: int | None = None,
     before: int | None = None,
-) -> str:
+    from_address: str | None = None,
+    extended: bool = False,
+) -> list[dict[str, Any]]:
     """Search iMessage and SMS text messages by content, chat, or time range.
 
     Full-text search across Apple iMessage and SMS text message history on the
@@ -465,6 +573,12 @@ async def search_messages(
         offset: Pagination offset.
         after: Only messages after this epoch-ms timestamp.
         before: Only messages before this epoch-ms timestamp.
+        from_address: Only return messages from this sender. Pass an E.164 phone
+                      number or email (e.g. '+15551234567'), or 'me' to filter
+                      to messages sent by the user. Server-side filter.
+        extended: KEEP FALSE. Only set True if you have verified the compact
+                  subset is missing a field you need AND get_message(guid,
+                  extended=True) cannot serve the specific message instead.
     """
     data = await _bb(ctx).search_messages(
         query=query,
@@ -473,22 +587,31 @@ async def search_messages(
         offset=offset,
         after=after,
         before=before,
+        handle_address=_resolve_address(ctx, from_address) if from_address else None,
     )
-    return _fmt(data)
+    return _project(data, extended)
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_message(ctx: Context, message_guid: str) -> str:
+async def get_message(
+    ctx: Context,
+    message_guid: str,
+    extended: bool = False,
+) -> dict[str, Any]:
     """Get a single iMessage or SMS text message by its GUID.
 
-    Returns the full message details including sender, timestamp, text body,
-    chat context, and any attachments for an Apple iMessage or SMS text message.
+    Returns message details for one specific message. Prefer this over setting
+    extended=True on bulk tools — fetch just the one message you need extra
+    fields for rather than expanding an entire result set.
 
     Args:
         message_guid: The message GUID.
+        extended: Set True to get all raw server fields (delivery flags, itemType,
+                  groupActionType, etc.). Use when compact fields are insufficient
+                  for a specific message. Default False returns the compact subset.
     """
     data = await _bb(ctx).get_message(message_guid)
-    return _fmt(data)
+    return _slim_message(data) if not extended else data
 
 
 # ---------------------------------------------------------------------------
@@ -497,18 +620,36 @@ async def get_message(ctx: Context, message_guid: str) -> str:
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_contacts(ctx: Context) -> str:
+async def get_contacts(
+    ctx: Context,
+    query: str | None = None,
+) -> list[dict[str, Any]]:
     """Get all contacts from the Apple iPhone/Mac address book via BlueBubbles.
 
     Returns the contact list from the device running the BlueBubbles iMessage bridge,
     including names, phone numbers, and email addresses.
+
+    Args:
+        query: Optional filter string. Returns only contacts whose display name
+               or any phone number/email contains this string (case-insensitive).
     """
     data = await _bb(ctx).get_contacts()
-    return _fmt(data)
+    if query:
+        q = query.lower()
+        data = [
+            c
+            for c in data
+            if q in (c.get("displayName") or "").lower()
+            or any(
+                q in (addr.get("address") or "").lower()
+                for addr in (c.get("phoneNumbers") or []) + (c.get("emails") or [])
+            )
+        ]
+    return data
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def lookup_contact(ctx: Context, addresses: list[str]) -> str:
+async def lookup_contact(ctx: Context, addresses: list[str]) -> list[dict[str, Any]]:
     """Look up Apple iPhone contacts by phone number or email address.
 
     Resolves phone numbers or email addresses to contact names and details
@@ -517,12 +658,11 @@ async def lookup_contact(ctx: Context, addresses: list[str]) -> str:
     Args:
         addresses: List of phone numbers or email addresses to look up.
     """
-    data = await _bb(ctx).query_contacts(addresses)
-    return _fmt(data)
+    return await _bb(ctx).query_contacts(addresses)
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def check_imessage(ctx: Context, address: str) -> str:
+async def check_imessage(ctx: Context, address: str) -> Any:
     """Check if a phone number or email is registered for Apple iMessage.
 
     Determines whether a contact can receive iMessage (blue bubble) vs SMS only
@@ -531,19 +671,17 @@ async def check_imessage(ctx: Context, address: str) -> str:
     Args:
         address: Phone number or email to check.
     """
-    data = await _bb(ctx).check_imessage_availability(address)
-    return _fmt(data)
+    return await _bb(ctx).check_imessage_availability(address)
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def check_facetime(ctx: Context, address: str) -> str:
+async def check_facetime(ctx: Context, address: str) -> Any:
     """Check if a phone number or email is registered for Apple FaceTime.
 
     Args:
         address: Phone number or email to check.
     """
-    data = await _bb(ctx).check_facetime_availability(address)
-    return _fmt(data)
+    return await _bb(ctx).check_facetime_availability(address)
 
 
 # ---------------------------------------------------------------------------
@@ -552,7 +690,7 @@ async def check_facetime(ctx: Context, address: str) -> str:
 
 
 @mcp.tool(annotations=IDEMPOTENT_WRITE)
-async def rename_group(ctx: Context, chat_guid: str, name: str) -> str:
+async def rename_group(ctx: Context, chat_guid: str, name: str) -> Any:
     """Rename an iMessage group chat.
 
     Sets a new display name for an Apple iMessage group text message thread.
@@ -561,12 +699,11 @@ async def rename_group(ctx: Context, chat_guid: str, name: str) -> str:
         chat_guid: The iMessage group chat GUID.
         name: New display name for the group.
     """
-    data = await _bb(ctx).rename_group(chat_guid, name)
-    return _fmt(data)
+    return await _bb(ctx).rename_group(chat_guid, name)
 
 
 @mcp.tool(annotations=SEND)
-async def add_participant(ctx: Context, chat_guid: str, address: str) -> str:
+async def add_participant(ctx: Context, chat_guid: str, address: str) -> Any:
     """Add a participant to an iMessage group chat.
 
     Adds a contact by phone number or email to an Apple iMessage group text thread.
@@ -575,12 +712,11 @@ async def add_participant(ctx: Context, chat_guid: str, address: str) -> str:
         chat_guid: The iMessage group chat GUID.
         address: Phone number or email of the person to add.
     """
-    data = await _bb(ctx).add_participant(chat_guid, address)
-    return _fmt(data)
+    return await _bb(ctx).add_participant(chat_guid, address)
 
 
 @mcp.tool(annotations=DESTRUCTIVE)
-async def remove_participant(ctx: Context, chat_guid: str, address: str) -> str:
+async def remove_participant(ctx: Context, chat_guid: str, address: str) -> Any:
     """Remove a participant from an iMessage group chat.
 
     Removes a contact from an Apple iMessage group text thread by phone number or email.
@@ -589,8 +725,7 @@ async def remove_participant(ctx: Context, chat_guid: str, address: str) -> str:
         chat_guid: The iMessage group chat GUID.
         address: Phone number or email of the person to remove.
     """
-    data = await _bb(ctx).remove_participant(chat_guid, address)
-    return _fmt(data)
+    return await _bb(ctx).remove_participant(chat_guid, address)
 
 
 @mcp.tool(annotations=DESTRUCTIVE)
@@ -612,13 +747,12 @@ async def leave_chat(ctx: Context, chat_guid: str) -> str:
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def list_scheduled_messages(ctx: Context) -> str:
+async def list_scheduled_messages(ctx: Context) -> list[dict[str, Any]]:
     """List all scheduled future iMessage and SMS text messages.
 
     Returns queued messages waiting to be sent via the BlueBubbles iMessage/SMS bridge.
     """
-    data = await _bb(ctx).list_scheduled_messages()
-    return _fmt(data)
+    return await _bb(ctx).list_scheduled_messages()
 
 
 @mcp.tool(annotations=SEND)
@@ -627,7 +761,7 @@ async def schedule_message(
     chat_guid: str,
     message: str,
     scheduled_for: int,
-) -> str:
+) -> dict[str, Any]:
     """Schedule an iMessage or SMS text message to be sent at a future time.
 
     Queues an Apple iMessage or SMS text to be delivered automatically at the
@@ -638,8 +772,7 @@ async def schedule_message(
         message: The message text.
         scheduled_for: When to send, as epoch milliseconds.
     """
-    data = await _bb(ctx).create_scheduled_message(chat_guid, message, scheduled_for)
-    return _fmt(data)
+    return await _bb(ctx).create_scheduled_message(chat_guid, message, scheduled_for)
 
 
 @mcp.tool(annotations=DESTRUCTIVE)
@@ -659,7 +792,7 @@ async def delete_scheduled_message(ctx: Context, schedule_id: int) -> str:
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_attachment_info(ctx: Context, attachment_guid: str) -> str:
+async def get_attachment_info(ctx: Context, attachment_guid: str) -> dict[str, Any]:
     """Get metadata for an iMessage or SMS attachment (photo, video, file, etc.).
 
     Returns filename, MIME type, and size for a media file or document attached
@@ -668,30 +801,32 @@ async def get_attachment_info(ctx: Context, attachment_guid: str) -> str:
     Args:
         attachment_guid: The attachment GUID.
     """
-    data = await _bb(ctx).get_attachment(attachment_guid)
-    return _fmt(data)
+    return await _bb(ctx).get_attachment(attachment_guid)
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def download_attachment(ctx: Context, attachment_guid: str) -> str:
+async def download_attachment(ctx: Context, attachment_guid: str) -> Any:
     """Download a photo, video, or file attachment from an iMessage or SMS text message.
 
     Retrieves the binary content of a media file or document attached to an Apple
-    iMessage or SMS text message, returned as base64-encoded data.
+    iMessage or SMS text message. Images are returned as inline image data;
+    other files are returned as base64-encoded data with metadata.
 
     Args:
         attachment_guid: The attachment GUID.
     """
     data = await _bb(ctx).download_attachment(attachment_guid)
     meta = await _bb(ctx).get_attachment(attachment_guid)
-    return _fmt(
-        {
-            "filename": meta.get("transferName"),
-            "mime_type": meta.get("mimeType"),
-            "size_bytes": len(data),
-            "data_base64": base64.b64encode(data).decode(),
-        }
-    )
+    mime_type: str = meta.get("mimeType") or "application/octet-stream"
+    if mime_type.startswith("image/"):
+        fmt = mime_type.split("/", 1)[1]
+        return Image(data=data, format=fmt)
+    return {
+        "filename": meta.get("transferName"),
+        "mime_type": mime_type,
+        "size_bytes": len(data),
+        "data_base64": base64.b64encode(data).decode(),
+    }
 
 
 @mcp.tool(annotations=SEND)
@@ -701,7 +836,7 @@ async def send_attachment(
     data_base64: str,
     filename: str,
     mime_type: str = "application/octet-stream",
-) -> str:
+) -> dict[str, Any]:
     """Send a photo, video, or file attachment via iMessage or SMS.
 
     Sends a media file or document to an Apple iMessage or SMS chat thread
@@ -714,8 +849,7 @@ async def send_attachment(
         mime_type: MIME type (e.g. 'image/jpeg'). Defaults to 'application/octet-stream'.
     """
     file_data = base64.b64decode(data_base64)
-    data = await _bb(ctx).send_attachment(chat_guid, file_data, filename, mime_type)
-    return _fmt(data)
+    return await _bb(ctx).send_attachment(chat_guid, file_data, filename, mime_type)
 
 
 # ---------------------------------------------------------------------------
@@ -723,9 +857,29 @@ async def send_attachment(
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+app = typer.Typer()
+
+
+@app.command()
+def main(
+    mask_errors: bool = typer.Option(
+        True,
+        "--mask-errors/--no-mask-errors",
+        envvar="BLUEBUBBLES_MASK_ERRORS",
+        help="Hide internal error details from MCP clients. Default: enabled.",
+    ),
+    my_address: str | None = typer.Option(
+        None,
+        "--my-address",
+        envvar="BLUEBUBBLES_MY_ADDRESS",
+        help="Override the detected iMessage address for the local user (e.g. '+15551234567'). "
+        "Defaults to the address reported by the BlueBubbles server.",
+    ),
+) -> None:
+    mcp.mask_error_details = mask_errors
+    mcp._my_address_override = my_address  # type: ignore[attr-defined]
     mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":
-    main()
+    app()

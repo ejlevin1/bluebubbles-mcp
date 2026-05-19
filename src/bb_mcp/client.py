@@ -24,6 +24,11 @@ class BlueBubblesClient:
 
     # -- internal helpers -----------------------------------------------------
 
+    @staticmethod
+    def _normalize_guid(chat_guid: str) -> str:
+        """Normalize chat GUIDs: replace iMessage;-; prefix with any;-; for API compatibility."""
+        return chat_guid.replace("iMessage;-;", "any;-;", 1)
+
     def _url(self, path: str) -> str:
         return f"{self._base_url}/api/v1{path}"
 
@@ -110,6 +115,7 @@ class BlueBubblesClient:
     async def get_chat(
         self, chat_guid: str, with_fields: list[str] | None = None
     ) -> dict[str, Any]:
+        chat_guid = self._normalize_guid(chat_guid)
         params: dict[str, Any] = {}
         if with_fields:
             params["with"] = ",".join(with_fields)
@@ -123,7 +129,9 @@ class BlueBubblesClient:
         sort: str = "DESC",
         after: int | None = None,
         before: int | None = None,
+        handle_address: str | None = None,
     ) -> list[dict[str, Any]]:
+        chat_guid = self._normalize_guid(chat_guid)
         params: dict[str, Any] = {
             "limit": limit,
             "offset": offset,
@@ -134,38 +142,48 @@ class BlueBubblesClient:
             params["after"] = after
         if before is not None:
             params["before"] = before
-        return await self._get(f"/chat/{chat_guid}/message", params=params)
+        messages = await self._get(f"/chat/{chat_guid}/message", params=params)
+        if handle_address:
+            messages = [
+                m
+                for m in messages
+                if (m.get("handle") or {}).get("address") == handle_address
+            ]
+        return messages
 
     async def mark_chat_read(self, chat_guid: str) -> Any:
-        return await self._post(f"/chat/{chat_guid}/read")
+        return await self._post(f"/chat/{self._normalize_guid(chat_guid)}/read")
 
     async def mark_chat_unread(self, chat_guid: str) -> Any:
-        return await self._post(f"/chat/{chat_guid}/unread")
+        return await self._post(f"/chat/{self._normalize_guid(chat_guid)}/unread")
 
     async def start_typing(self, chat_guid: str) -> Any:
-        return await self._post(f"/chat/{chat_guid}/typing")
+        return await self._post(f"/chat/{self._normalize_guid(chat_guid)}/typing")
 
     async def stop_typing(self, chat_guid: str) -> Any:
-        return await self._delete(f"/chat/{chat_guid}/typing")
+        return await self._delete(f"/chat/{self._normalize_guid(chat_guid)}/typing")
 
     async def delete_chat(self, chat_guid: str) -> Any:
-        return await self._delete(f"/chat/{chat_guid}")
+        return await self._delete(f"/chat/{self._normalize_guid(chat_guid)}")
 
     async def rename_group(self, chat_guid: str, display_name: str) -> Any:
+        chat_guid = self._normalize_guid(chat_guid)
         return await self._put(f"/chat/{chat_guid}", json={"displayName": display_name})
 
     async def add_participant(self, chat_guid: str, address: str) -> Any:
+        chat_guid = self._normalize_guid(chat_guid)
         return await self._post(
             f"/chat/{chat_guid}/participant/add", json={"address": address}
         )
 
     async def remove_participant(self, chat_guid: str, address: str) -> Any:
+        chat_guid = self._normalize_guid(chat_guid)
         return await self._post(
             f"/chat/{chat_guid}/participant/remove", json={"address": address}
         )
 
     async def leave_chat(self, chat_guid: str) -> Any:
-        return await self._post(f"/chat/{chat_guid}/leave")
+        return await self._post(f"/chat/{self._normalize_guid(chat_guid)}/leave")
 
     # -- messages -------------------------------------------------------------
 
@@ -177,8 +195,7 @@ class BlueBubblesClient:
         subject: str | None = None,
         reply_to_guid: str | None = None,
     ) -> dict[str, Any]:
-        if method == "apple-script":
-            chat_guid = chat_guid.replace("iMessage;-;", "any;-;", 1)
+        chat_guid = self._normalize_guid(chat_guid)
         body: dict[str, Any] = {
             "chatGuid": chat_guid,
             "tempGuid": f"temp-{uuid.uuid4().hex}",
@@ -219,7 +236,7 @@ class BlueBubblesClient:
         part_index: int = 0,
     ) -> Any:
         body: dict[str, Any] = {
-            "chatGuid": chat_guid,
+            "chatGuid": self._normalize_guid(chat_guid),
             "selectedMessageGuid": message_guid,
             "reaction": reaction,
             "partIndex": part_index,
@@ -255,6 +272,7 @@ class BlueBubblesClient:
         sort: str = "DESC",
         after: int | None = None,
         before: int | None = None,
+        handle_address: str | None = None,
     ) -> list[dict[str, Any]]:
         body: dict[str, Any] = {
             "limit": limit,
@@ -263,18 +281,28 @@ class BlueBubblesClient:
             "with": ["chats", "attachment"],
         }
         if chat_guid:
-            body["chatGuid"] = chat_guid
+            body["chatGuid"] = self._normalize_guid(chat_guid)
         if after:
             body["after"] = after
         if before:
             body["before"] = before
+        where: list[dict[str, Any]] = []
         if query:
-            body["where"] = [
+            where.append(
                 {
                     "statement": "message.text LIKE :query",
                     "args": {"query": f"%{query}%"},
                 }
-            ]
+            )
+        if handle_address:
+            where.append(
+                {
+                    "statement": "handle.id = :address",
+                    "args": {"address": handle_address},
+                }
+            )
+        if where:
+            body["where"] = where
         return await self._post("/message/query", json=body)
 
     async def get_message(self, message_guid: str) -> dict[str, Any]:
@@ -328,7 +356,7 @@ class BlueBubblesClient:
             self._url("/message/attachment"),
             params=self._auth_params(),
             data={
-                "chatGuid": chat_guid,
+                "chatGuid": self._normalize_guid(chat_guid),
                 "tempGuid": f"temp-{uuid.uuid4().hex}",
                 "method": method,
                 "name": filename,
@@ -353,7 +381,7 @@ class BlueBubblesClient:
         scheduled_for: int,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
-            "chatGuid": chat_guid,
+            "chatGuid": self._normalize_guid(chat_guid),
             "message": message,
             "scheduledFor": scheduled_for,
             "tempGuid": f"temp-{uuid.uuid4().hex}",

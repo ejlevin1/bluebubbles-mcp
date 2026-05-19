@@ -8,18 +8,19 @@ Spawns the MCP server locally and checks:
 
 Usage:
     uv run scripts/validate_tools.py
-    uv run scripts/validate_tools.py --send-message "+15551234567"
+    uv run scripts/validate_tools.py --send-message "+15551234567"  # or set BLUEBUBBLES_MY_ADDRESS
     BLUEBUBBLES_URL=http://... BLUEBUBBLES_PASSWORD=... uv run scripts/validate_tools.py
 """
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import os
-import sys
 import urllib.request
+from typing import Optional
+
+import typer
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -27,6 +28,7 @@ from mcp.client.stdio import stdio_client
 ALWAYS_PRESENT = [
     "ping",
     "get_server_info",
+    "get_my_address",
     "list_chats",
     "get_chat",
     "get_chat_messages",
@@ -64,6 +66,18 @@ PRIVATE_API_ONLY = [
 ]
 
 
+def _load_dotenv() -> None:
+    """Load .env from the project root into os.environ if vars are missing."""
+    env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+
+
 def get_server_private_api_status(url: str, password: str) -> bool:
     """Query /server/info directly to get the ground-truth private_api flag."""
     req_url = f"{url.rstrip('/')}/api/v1/server/info?password={password}"
@@ -78,41 +92,58 @@ def check(condition: bool, label: str) -> bool:
     return condition
 
 
-async def main() -> None:
-    parser = argparse.ArgumentParser(description="Validate BlueBubbles MCP tool list")
-    parser.add_argument(
+app = typer.Typer()
+
+
+@app.command()
+def main(
+    send_message: Optional[str] = typer.Option(
+        None,
         "--send-message",
-        metavar="PHONE",
-        help="After validation, send a test message to this phone number via send_message_to_address",
-    )
-    args = parser.parse_args()
-
-    url = os.environ.get("BLUEBUBBLES_URL")
-    password = os.environ.get("BLUEBUBBLES_PASSWORD")
+        envvar="BLUEBUBBLES_MY_ADDRESS",
+        metavar="ADDRESS",
+        help="After validation, send a test message to this address via send_message_to_address. "
+        "Defaults to BLUEBUBBLES_MY_ADDRESS if set.",
+    ),
+    url: Optional[str] = typer.Option(
+        None,
+        "--url",
+        envvar="BLUEBUBBLES_URL",
+        help="BlueBubbles server URL.",
+    ),
+    password: Optional[str] = typer.Option(
+        None,
+        "--password",
+        envvar="BLUEBUBBLES_PASSWORD",
+        help="BlueBubbles server password.",
+    ),
+) -> None:
+    """Validate that the BlueBubbles MCP tool list matches server capabilities."""
+    # Fall back to .env for any values not already set
     if not url or not password:
-        # Try loading from .env in the project root
-        env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
-        if os.path.exists(env_path):
-            for line in open(env_path):
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    os.environ.setdefault(k.strip(), v.strip())
-            url = os.environ.get("BLUEBUBBLES_URL")
-            password = os.environ.get("BLUEBUBBLES_PASSWORD")
+        _load_dotenv()
+        url = url or os.environ.get("BLUEBUBBLES_URL")
+        password = password or os.environ.get("BLUEBUBBLES_PASSWORD")
 
     if not url or not password:
-        print("ERROR: BLUEBUBBLES_URL and BLUEBUBBLES_PASSWORD must be set (or present in .env)", file=sys.stderr)
-        sys.exit(1)
+        typer.echo(
+            "ERROR: BLUEBUBBLES_URL and BLUEBUBBLES_PASSWORD must be set (or present in .env)",
+            err=True,
+        )
+        raise typer.Exit(1)
 
+    asyncio.run(_run(url=url, password=password, send_message=send_message))
+
+
+async def _run(url: str, password: str, send_message: str | None) -> None:
     print(f"Server: {url}")
 
     print("\n[1] Checking server private_api status via REST...")
     try:
         private_api_enabled = get_server_private_api_status(url, password)
     except Exception as e:
-        print(f"  ERROR: Could not reach server — {e}", file=sys.stderr)
-        sys.exit(1)
+        typer.echo(f"  ERROR: Could not reach server — {e}", err=True)
+        raise typer.Exit(1)
     print(f"  private_api = {private_api_enabled}")
 
     print("\n[2] Spawning MCP server and listing tools...")
@@ -131,16 +162,20 @@ async def main() -> None:
             tools_resp = await session.list_tools()
             tool_names = {t.name for t in tools_resp.tools}
 
-            if args.send_message:
-                phone = args.send_message
-
-                ta_args = {"address": phone, "message": "Test message from validate_tools.py (send_message_to_address)"}
+            if send_message:
+                ta_args = {
+                    "address": send_message,
+                    "message": "Test message from validate_tools.py (send_message_to_address)",
+                }
                 print(f"\n[*] send_message_to_address({json.dumps(ta_args)})")
                 result = await session.call_tool("send_message_to_address", ta_args)
                 send_results.append(("send_message_to_address", result))
 
-                chat_guid = f"any;-;{phone}"
-                sm_args = {"chat_guid": chat_guid, "message": "Test message from validate_tools.py (send_message)"}
+                chat_guid = f"any;-;{send_message}"
+                sm_args = {
+                    "chat_guid": chat_guid,
+                    "message": "Test message from validate_tools.py (send_message)",
+                }
                 print(f"[*] send_message({json.dumps(sm_args)})")
                 result = await session.call_tool("send_message", sm_args)
                 send_results.append(("send_message", result))
@@ -152,7 +187,9 @@ async def main() -> None:
         if not check(name in tool_names, f"{name} present"):
             failures += 1
 
-    print(f"\n[4] Validating Private API tools (expected {'present' if private_api_enabled else 'absent'})...")
+    print(
+        f"\n[4] Validating Private API tools (expected {'present' if private_api_enabled else 'absent'})..."
+    )
     for name in PRIVATE_API_ONLY:
         if private_api_enabled:
             if not check(name in tool_names, f"{name} present (private_api=true)"):
@@ -161,14 +198,18 @@ async def main() -> None:
             if not check(name not in tool_names, f"{name} absent (private_api=false)"):
                 failures += 1
 
-    print(f"\n[5] Checking for unexpected tools...")
+    print("\n[5] Checking for unexpected tools...")
     known = set(ALWAYS_PRESENT) | set(PRIVATE_API_ONLY)
     unexpected = tool_names - known
     if unexpected:
-        print(f"  [WARN] Unknown tools (not in ALWAYS_PRESENT or PRIVATE_API_ONLY): {sorted(unexpected)}")
-        print(f"         Add them to the appropriate list in this script if they are intentional.")
+        print(
+            f"  [WARN] Unknown tools (not in ALWAYS_PRESENT or PRIVATE_API_ONLY): {sorted(unexpected)}"
+        )
+        print(
+            "         Add them to the appropriate list in this script if they are intentional."
+        )
     else:
-        print(f"  [PASS] No unexpected tools")
+        print("  [PASS] No unexpected tools")
 
     for tool_name, result in send_results:
         print(f"\n[{tool_name} result]")
@@ -176,17 +217,17 @@ async def main() -> None:
             print(f"  [FAIL] {result.content}")
             failures += 1
         else:
-            print(f"  [PASS] message sent")
+            print("  [PASS] message sent")
             for block in result.content:
                 print(f"  {block.text[:200]}")
 
     print()
     if failures:
         print(f"FAILED — {failures} check(s) did not pass.")
-        sys.exit(1)
+        raise typer.Exit(1)
     else:
         print("PASSED — tool list matches server capabilities.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    app()

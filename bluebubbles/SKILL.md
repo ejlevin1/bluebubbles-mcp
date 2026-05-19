@@ -115,7 +115,7 @@ GUIDs identify conversations. The format encodes the chat type:
 | `any;-;user@example.com` | 1:1 direct message with an email |
 | `any;+;chat<hash>` | Group chat |
 
-**Never construct GUIDs manually for group chats** — always look them up via `list_chats` or `get_chat`. For 1:1 chats, `any;-;<E.164 address>` is reliable. The `iMessage;-;` prefix is invalid for AppleScript sends — the MCP client normalizes this automatically.
+**Never construct GUIDs manually for group chats** — always look them up via `list_chats` or `get_chat`. For 1:1 chats, `any;-;<E.164 address>` is reliable. The `iMessage;-;` prefix is automatically normalized to `any;-;` by the MCP client for all reads and sends.
 
 ## Decision Tree
 
