@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.scripts]
-bb-mcp = "bb_mcp.server:main"
+bb-mcp = "bb_mcp.server:app"
 
 [project.optional-dependencies]
 dev = [
