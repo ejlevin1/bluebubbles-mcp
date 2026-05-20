@@ -268,6 +268,18 @@ class TestChats:
         assert params.get("offset") == "10"
         assert params.get("sort") == "ASC"
 
+    async def test_get_chat_messages_handle_address_filter(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        msgs = [
+            {"guid": "m1", "handle": {"address": "+1555"}},
+            {"guid": "m2", "handle": {"address": "+9999"}},
+        ]
+        mock_api.get(f"{API}/chat/g1/message").mock(return_value=ok_json(msgs))
+        result = await client.get_chat_messages("g1", handle_address="+1555")
+        assert len(result) == 1
+        assert result[0]["guid"] == "m1"
+
     async def test_mark_chat_read(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
@@ -508,6 +520,17 @@ class TestMessages:
         assert len(body["where"]) == 1
         assert "%hello%" in body["where"][0]["args"]["query"]
 
+    async def test_search_messages_with_handle_address(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.post(f"{API}/message/query").mock(return_value=ok_json([]))
+        await client.search_messages(handle_address="+15551234567")
+        import json
+
+        body = json.loads(route.calls[0].request.content)
+        assert len(body["where"]) == 1
+        assert body["where"][0]["args"]["address"] == "+15551234567"
+
     async def test_get_message(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
@@ -604,6 +627,30 @@ class TestAttachments:
         )
         with pytest.raises(httpx.HTTPStatusError):
             await client.download_attachment("att1")
+
+    async def test_send_attachment(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.post(f"{API}/message/attachment").mock(
+            return_value=ok_json({"guid": "att-sent"})
+        )
+        result = await client.send_attachment(
+            "iMessage;-;+1555", b"filedata", "photo.jpg", "image/jpeg"
+        )
+        assert result == {"guid": "att-sent"}
+        req = route.calls[0].request
+        assert req.url.params.get("password") == PASSWORD
+        assert b"photo.jpg" in req.content
+        assert b"filedata" in req.content
+
+    async def test_send_attachment_api_error(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        mock_api.post(f"{API}/message/attachment").mock(
+            return_value=api_error_json("attachment failed", api_status=500)
+        )
+        with pytest.raises(BlueBubblesError, match="attachment failed"):
+            await client.send_attachment("g1", b"data", "file.bin")
 
 
 # ===========================================================================

@@ -406,9 +406,10 @@ async def test_attachments(c: Client, att_guid: str | None) -> Suite:
     return s
 
 
-async def test_send(c: Client, my_address: str, chat_guid: str | None) -> Suite:
+async def test_send(c: Client, my_address: str) -> Suite:
     s = Suite("7. Send (live — messages will be delivered)")
 
+    # Send to self via address — this also returns the chat GUID we can reuse.
     ta = _data(
         await c.call_tool(
             "send_message_to_address",
@@ -423,14 +424,22 @@ async def test_send(c: Client, my_address: str, chat_guid: str | None) -> Suite:
         "send_message_to_address returns dict with guid",
     )
 
-    if not chat_guid:
-        s.skip("send_message", "no chat_guid available")
+    # Derive the self-chat GUID from the sent message so send_message also goes
+    # to self — not to whatever arbitrary chat happened to be most recent.
+    self_chat_guid: str | None = None
+    if isinstance(ta, dict):
+        chats = ta.get("chats") or []
+        if chats and isinstance(chats[0], dict):
+            self_chat_guid = chats[0].get("guid")
+
+    if not self_chat_guid:
+        s.skip("send_message", "could not derive self-chat GUID from sent message")
     else:
         sm = _data(
             await c.call_tool(
                 "send_message",
                 {
-                    "chat_guid": chat_guid,
+                    "chat_guid": self_chat_guid,
                     "message": "[bb-mcp e2e] send_message",
                 },
             )
@@ -523,7 +532,7 @@ async def _run(send: bool) -> None:
                     err=True,
                 )
             else:
-                s_send = await test_send(c, my_address, first_guid)
+                s_send = await test_send(c, my_address)
                 suites.append(s_send)
         else:
             print("\n[SKIP] Send tests — pass --send to enable")
