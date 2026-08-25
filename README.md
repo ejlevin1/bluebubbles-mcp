@@ -122,7 +122,7 @@ just setup   # installs deps and git hooks
 | `check_imessage` | Check iMessage registration | read-only |
 | `check_facetime` | Check FaceTime registration | read-only |
 | `list_scheduled_messages` | List future messages | read-only |
-| `get_recent_messages` | Messages from last N minutes across all chats | read-only |
+| `get_recent_messages` | New + changed messages since a cursor (incremental polling) | read-only |
 | `get_unread_chats` | Chats with unread messages + their latest messages | read-only |
 | `get_attachment_info` | Attachment metadata | read-only |
 | `download_attachment` | Download attachment as base64 | read-only |
@@ -143,6 +143,54 @@ just setup   # installs deps and git hooks
 | `leave_chat` | Leave a group chat | destructive, open-world |
 | `delete_chat` | Delete a conversation | destructive, open-world |
 | `delete_scheduled_message` | Cancel scheduled message | destructive, open-world |
+
+## Polling for new messages
+
+`get_recent_messages` returns a cursor. Pass it back as `since` on the next call and you
+get only what is new or changed since then — no duplicates, and including edits and
+unsends of messages that are already old.
+
+```python
+result = get_recent_messages(minutes=60)          # first call seeds the window
+
+while True:
+    for message in result["messages"]:
+        handle(message)
+    for message in result["changed"]:             # edited or unsent since last poll
+        reconcile(message)
+
+    if not result["has_more"]:
+        sleep(30)                                  # caught up; wait before polling again
+    result = get_recent_messages(since=result["cursor"])
+```
+
+Two rules matter:
+
+- **`has_more: true` means poll again immediately.** There is a backlog and you are
+  holding a partial page; waiting for the next interval just delays it.
+- **Pass the cursor back verbatim.** It encodes two independent watermarks, and a
+  malformed value is rejected rather than silently reinterpreted.
+
+Do not poll by calling with `minutes` repeatedly — that re-reads the same messages every
+time and can never show you an edit or an unsend, because `after` filters only on when a
+message was *created*.
+
+### Why two watermarks
+
+A message edited a moment ago may be years old, so it sorts near the front by creation
+date. A single cursor derived from such a batch lands *behind* where the poll started,
+and the next poll returns the identical batch forever. The cursor therefore tracks
+creation and modification separately, and `messages` and `changed` are reported apart.
+
+### Other fields
+
+| Field | Meaning |
+|-------|---------|
+| `reactions` | Tapbacks among the new messages, with the message GUID each targets |
+| `cursor_advanced` | `false` means nothing was consumed — check `notes` and back off |
+| `counts.no_chat` | Messages belonging to no conversation (SMS shortcodes, 2FA senders) |
+| `stalled_ms` | Non-null when more messages than one page can hold share a millisecond |
+| `notes` | Warnings worth surfacing; empty in the happy path |
 
 ## License
 

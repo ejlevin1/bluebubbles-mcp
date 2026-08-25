@@ -16,6 +16,15 @@ from fastmcp.utilities.types import Image
 from mcp.types import ToolAnnotations
 
 from bb_mcp.client import BlueBubblesClient
+from bb_mcp.cursor import (
+    MAX_PAGE,
+    Cursor,
+    advance_changed,
+    advance_created,
+    merge_monotonic,
+    split_overfetch,
+    summarize_reactions,
+)
 
 logger = get_logger(__name__)
 
@@ -120,6 +129,9 @@ mcp = FastMCP(
         "chats, sending attachments/photos/files, scheduling future messages, tapback reactions, "
         "editing/unsending messages, marking chats read/unread, looking up contacts, and checking "
         "iMessage or FaceTime availability for a phone number or email.\n\n"
+        "To follow conversations over time, poll get_recent_messages and pass the cursor "
+        "it returns back as `since` — that is the only way to see new messages, edits, and "
+        "unsends without re-reading what you already have.\n\n"
         "Not for: email, phone/FaceTime calls, or other platforms (Slack, WhatsApp, Telegram).\n\n"
         "All sends, reactions, and read receipts are real and visible to the other person. "
         "Always confirm with the user before destructive actions (delete chat, unsend message, "
@@ -137,6 +149,19 @@ def _bb(ctx: Context) -> BlueBubblesClient:
 
 def _private_api(ctx: Context) -> bool:
     return ctx.lifespan_context["private_api"]
+
+
+def _sender_filter(ctx: Context, address: str | None) -> tuple[str | None, bool]:
+    """Split a `from_address` into (handle_address, from_me).
+
+    'me' cannot be expressed as a handle: `handle` names the OTHER party even on
+    outgoing messages, so filtering on the user's own address matches nothing.
+    """
+    if address is None:
+        return None, False
+    if address.strip().lower() == "me":
+        return None, True
+    return _resolve_address(ctx, address), False
 
 
 def _resolve_address(ctx: Context, address: str) -> str:
@@ -192,6 +217,40 @@ def _slim_message(msg: dict[str, Any]) -> dict[str, Any]:
 
 def _project(data: list[dict[str, Any]], extended: bool) -> list[dict[str, Any]]:
     return data if extended else [_slim_message(m) for m in data]
+
+
+async def _attach_chats(
+    bb: BlueBubblesClient, rows: list[dict[str, Any]], notes: list[str]
+) -> int:
+    """Fill in each row's ``chats`` with a second pass. Returns the "no chat" count.
+
+    The primary query cannot ask for chats: ``with: ["chats"]`` is an INNER join that
+    silently drops every message belonging to no chat row — 4.70% over a 30-day window
+    on a live server, and the dropped rows are exactly the SMS shortcodes and 2FA
+    senders someone polling would most want to see. Resolving separately means those
+    rows arrive with ``chats: []`` instead of vanishing.
+    """
+    if not rows:
+        return 0
+    try:
+        resolved = await bb.resolve_message_chats([r.get("guid") or "" for r in rows])
+    except Exception as exc:  # noqa: BLE001 - a failed lookup must not cost the cursor
+        # Returning no cursor would make the caller replay the same window forever,
+        # which is far worse than missing chat labels for one poll.
+        for row in rows:
+            row["chats"] = row.get("chats") or []
+        notes.append(
+            f"Chat attribution unavailable this poll ({type(exc).__name__}); "
+            "messages are complete but unlabelled."
+        )
+        return 0
+    missing = 0
+    for row in rows:
+        chats = resolved.get(row.get("guid") or "")
+        row["chats"] = chats or []
+        if not chats:
+            missing += 1
+    return missing
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +350,10 @@ async def get_chat_messages(
     Retrieves the message history for an Apple iMessage or SMS thread, with optional
     time range filtering. Messages include sender, timestamp, text body, and attachments.
 
+    `after` is a fixed time window, not a cursor — repeated calls re-read the same
+    messages and never show edits or unsends. To follow a conversation over time, use
+    get_recent_messages with its cursor.
+
     Args:
         chat_guid: The chat GUID.
         limit: Max messages to return (default 25).
@@ -308,6 +371,7 @@ async def get_chat_messages(
                   Compact fields: guid, text, handle, isFromMe, dateCreated,
                   attachments, replyToGuid, associatedMessageGuid/Type, chats, error.
     """
+    handle_address, from_me = _sender_filter(ctx, from_address)
     data = await _bb(ctx).get_chat_messages(
         chat_guid,
         limit=limit,
@@ -315,7 +379,8 @@ async def get_chat_messages(
         sort=sort,
         after=after,
         before=before,
-        handle_address=_resolve_address(ctx, from_address) if from_address else None,
+        handle_address=handle_address,
+        from_me=from_me,
     )
     return _project(data, extended)
 
@@ -323,33 +388,147 @@ async def get_chat_messages(
 @mcp.tool(annotations=READ_ONLY)
 async def get_recent_messages(
     ctx: Context,
-    minutes: int = 60,
+    since: str | None = None,
+    minutes: int | None = None,
     limit: int = 50,
     from_address: str | None = None,
     extended: bool = False,
-) -> list[dict[str, Any]]:
-    """Get recent iMessage and SMS text messages across all conversations within a time window.
+) -> dict[str, Any]:
+    """Get NEW and recently-changed iMessage and SMS text messages since your last check.
 
-    Fetches the latest Apple iMessage and SMS messages received on the bridged iPhone/Mac
-    across all chats, useful for checking what text messages arrived recently.
+    This is the tool for following Apple iMessage and SMS conversations over time on the
+    bridged iPhone/Mac. Call it repeatedly, passing the `cursor` from the previous
+    response back as `since`, and each call returns only what is new or changed since
+    then — including edits and unsends of older messages, which a plain time window
+    cannot see at all. Omit `since` for a first look at a recent time window.
+
+    Do NOT poll by calling this again with `minutes`. That re-reads the same messages
+    every time, wastes context on duplicates, and never surfaces edits or unsends.
+
+    Returns a dict with:
+        messages: New messages, oldest first.
+        changed: Messages edited or unsent since the last check (these may be old).
+        reactions: Tapbacks among the new messages, with the GUID they target.
+        cursor: Pass back as `since` on the next call.
+        has_more: True means there is a backlog — call again IMMEDIATELY with the new
+                  cursor rather than waiting for your next poll interval.
+        cursor_advanced: False means nothing was consumed; check `notes` and back off.
+        counts, notes: Totals and any warnings worth surfacing.
 
     Args:
-        minutes: How far back to look (default 60 minutes).
-        limit: Max messages to return (default 50).
-        from_address: Only return messages from this sender. Pass an E.164 phone
-                      number or email (e.g. '+15551234567'), or 'me' to filter
-                      to messages sent by the user. Server-side filter.
+        since: Resume token. Pass the `cursor` string from a previous response
+               VERBATIM — do not parse, construct, or edit it. An ISO-8601 timestamp
+               or epoch milliseconds also works to start from a specific point.
+               When set, `minutes` is ignored.
+        minutes: How far back to look when `since` is omitted (default 60).
+        limit: Max messages per axis per call (default 50, max 999).
+        from_address: Only messages from this sender. Pass an E.164 phone number or
+                      email (e.g. '+15551234567'), or 'me' for the user's own messages.
+                      Server-side filter.
         extended: KEEP FALSE. Only set True if you have verified the compact
                   subset is missing a field you need AND get_message(guid,
                   extended=True) cannot serve the specific message instead.
     """
-    after = int((time.time() - minutes * 60) * 1000)
-    data = await _bb(ctx).search_messages(
-        after=after,
-        limit=limit,
-        handle_address=_resolve_address(ctx, from_address) if from_address else None,
+    bb = _bb(ctx)
+    now_ms = int(time.time() * 1000)
+    page = max(1, min(int(limit), MAX_PAGE))
+    notes: list[str] = []
+
+    if since is not None:
+        cursor = Cursor.parse(since, now_ms=now_ms)
+        if minutes is not None:
+            notes.append("`minutes` was ignored because `since` was provided.")
+    else:
+        window = 60 if minutes is None else max(1, int(minutes))
+        cursor = Cursor.seed(now_ms - window * 60_000)
+
+    handle_address, from_me = _sender_filter(ctx, from_address)
+
+    async def fetch_created(page_size: int) -> list[dict[str, Any]]:
+        return await bb.query_created_since(
+            since_ms=cursor.created_ms,
+            limit=page_size,
+            handle_address=handle_address,
+            from_me=from_me,
+        )
+
+    async def fetch_changed(page_size: int) -> list[dict[str, Any]]:
+        return await bb.query_changed_since(
+            since_ms=cursor.changed_ms,
+            limit=page_size,
+            handle_address=handle_address,
+            from_me=from_me,
+        )
+
+    created_raw, changed_raw = await asyncio.gather(
+        fetch_created(page + 1), fetch_changed(page + 1)
     )
-    return _project(data, extended)
+
+    created = advance_created(
+        created_raw, prev_ms=cursor.created_ms, limit=page, now_ms=now_ms
+    )
+
+    # A truncated page sitting entirely inside one millisecond cannot advance without
+    # either skipping rows or re-fetching the millisecond. Retry once at the largest
+    # page the server allows so the walk keeps moving.
+    if created.stalled_ms is not None and page < MAX_PAGE:
+        created = advance_created(
+            await fetch_created(MAX_PAGE + 1),
+            prev_ms=cursor.created_ms,
+            limit=MAX_PAGE,
+            now_ms=now_ms,
+        )
+    notes.extend(created.notes)
+    if created.stalled_ms is not None:
+        notes.append(
+            f"More than {MAX_PAGE} messages share millisecond {created.stalled_ms}; "
+            "the cursor is holding there so none are lost. Expect repeats."
+        )
+
+    changed_rows, changed_truncated = split_overfetch(changed_raw, page)
+    if changed_truncated and page < MAX_PAGE:
+        changed_rows, changed_truncated = split_overfetch(
+            await fetch_changed(MAX_PAGE + 1), MAX_PAGE
+        )
+    if changed_truncated:
+        notes.append(
+            "More edits and unsends than fit in one page. The changed cursor is "
+            "holding position so none are lost — expect repeats until it drains."
+        )
+
+    next_cursor, monotonic_notes = merge_monotonic(
+        cursor,
+        Cursor(
+            created_ms=created.next_ms,
+            changed_ms=advance_changed(
+                changed_rows,
+                prev_ms=cursor.changed_ms,
+                truncated=changed_truncated,
+                now_ms=now_ms,
+            ),
+        ),
+    )
+    notes.extend(monotonic_notes)
+
+    reactions = summarize_reactions(created.rows)
+    no_chat = await _attach_chats(bb, [*created.rows, *changed_rows], notes)
+
+    return {
+        "messages": _project(created.rows, extended),
+        "changed": _project(changed_rows, extended),
+        "reactions": reactions,
+        "cursor": next_cursor.encode(),
+        "has_more": created.truncated or changed_truncated,
+        "cursor_advanced": next_cursor != cursor,
+        "counts": {
+            "new": len(created.rows),
+            "changed": len(changed_rows),
+            "reactions": len(reactions),
+            "no_chat": no_chat,
+        },
+        "stalled_ms": created.stalled_ms,
+        "notes": notes,
+    }
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -362,6 +541,12 @@ async def get_unread_chats(
 
     Returns Apple iMessage and SMS chats that have unread messages on the bridged
     iPhone/Mac, along with their most recent messages.
+
+    This reflects the USER's read/unread flag, which flips when they read a message on
+    their phone. It is not a record of what you have already seen: a message you
+    already handled can still be unread, and one you have never seen can already be
+    read. To track what is new to YOU across calls, use get_recent_messages and its
+    cursor instead.
 
     Args:
         message_limit: Number of recent messages to include per unread chat (default 5).
@@ -566,6 +751,13 @@ async def search_messages(
     Full-text search across Apple iMessage and SMS text message history on the
     bridged iPhone/Mac. Filter by keyword, conversation, or date range.
 
+    For finding known content in history. To detect messages that are NEW since your
+    last check, use get_recent_messages instead.
+
+    Text search runs against the stored `text` column, so messages whose body lives
+    only in `attributedBody` are unreachable by keyword even though their text appears
+    in the response. An empty result is not proof that nothing matched.
+
     Args:
         query: Text to search for in message bodies.
         chat_guid: Limit search to a specific iMessage or SMS chat.
@@ -580,15 +772,19 @@ async def search_messages(
                   subset is missing a field you need AND get_message(guid,
                   extended=True) cannot serve the specific message instead.
     """
-    data = await _bb(ctx).search_messages(
+    handle_address, from_me = _sender_filter(ctx, from_address)
+    bb = _bb(ctx)
+    data = await bb.search_messages(
         query=query,
         chat_guid=chat_guid,
         limit=limit,
         offset=offset,
         after=after,
         before=before,
-        handle_address=_resolve_address(ctx, from_address) if from_address else None,
+        handle_address=handle_address,
+        from_me=from_me,
     )
+    await _attach_chats(bb, data, [])
     return _project(data, extended)
 
 

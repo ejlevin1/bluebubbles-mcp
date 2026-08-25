@@ -89,6 +89,26 @@ ToolCatalog enables matching tools and returns their names in `enabledTools`. On
 
 Combine `search_messages(query=...)` with `chat_guid` to scope to one thread.
 
+These are fixed windows. To watch for *new* messages instead, use the cursor — see below.
+
+## Polling for New Messages
+
+`get_recent_messages` returns a `cursor`. Pass it back as `since` and the next call
+returns only what changed since then.
+
+- First call: `get_recent_messages(minutes=60)`
+- Every call after: `get_recent_messages(since=<cursor>)`
+- `has_more: true` → poll again immediately, there is a backlog
+- `messages` = newly created; `changed` = edited or unsent since last poll
+- Pass the cursor back verbatim; a malformed one is rejected, not reinterpreted
+
+Re-calling with `minutes` is not polling — it re-reads the same messages and cannot see
+edits or unsends, because `after` filters only on when a message was created.
+
+Text search runs against the stored `text` column, so messages whose body lives only in
+`attributedBody` will not match a keyword even though their text appears in the response.
+An empty result is not proof of absence.
+
 ## Attachments
 
 - Use `get_attachment_info` first (filename, MIME, size)

@@ -2,10 +2,62 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
-from typing import Any
+from collections.abc import Sequence
+from typing import Any, Final
 
 import httpx
+
+from bb_mcp.cursor import changed_bind_ns, exclusive_apple_ns
+
+
+#: GUID batch size for :meth:`BlueBubblesClient.resolve_message_chats`. Well under
+#: SQLite's 999-variable ceiling once the ``IN (:...guids)`` spread expands.
+_GUID_CHUNK: Final = 400
+
+
+def escape_like(term: str) -> str:
+    r"""Escape ``\``, ``%`` and ``_`` for a LIKE pattern used with ``ESCAPE '\'``.
+
+    Without this a query of ``%`` matches the entire table. Measured on a live server:
+    ``text LIKE '%_%'`` returned every row (capped at 1000) where the escaped form
+    returned 942.
+    """
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _like_clause(query: str) -> dict[str, Any]:
+    # Careful: `statement` is concatenated into SQL verbatim and only `args` are bound,
+    # so the search term must never be interpolated here.
+    #
+    # Caveat for macOS 13+ servers with the Private API enabled: MessageRouter.query
+    # DELETES the where-clause containing `message.text` and reroutes to
+    # searchMessagesPrivateApi, parsing the bind variable out as
+    # `statement.split(" ")[2]` and stripping the outer `%`. Under that path Spotlight
+    # does the matching and this escaping silently becomes a no-op. The trailing
+    # ESCAPE clause does not disturb `split(" ")[2]`, so it is safe to send either way.
+    return {
+        "statement": "message.text LIKE :query ESCAPE '\\'",
+        "args": {"query": f"%{escape_like(query)}%"},
+    }
+
+
+def _sender_clauses(handle_address: str | None, from_me: bool) -> list[dict[str, Any]]:
+    """Build the sender filter.
+
+    ``handle`` carries the *other* party, never the account owner, so
+    ``handle.id = <my own address>`` matches nothing at all — verified live: 0 rows
+    against 85 outgoing messages in the same window. Filtering to the user's own
+    messages has to go through ``message.is_from_me``.
+    """
+    if from_me:
+        return [{"statement": "message.is_from_me = :fromMe", "args": {"fromMe": 1}}]
+    if handle_address:
+        return [
+            {"statement": "handle.id = :address", "args": {"address": handle_address}}
+        ]
+    return []
 
 
 class BlueBubblesClient:
@@ -130,6 +182,7 @@ class BlueBubblesClient:
         after: int | None = None,
         before: int | None = None,
         handle_address: str | None = None,
+        from_me: bool = False,
     ) -> list[dict[str, Any]]:
         chat_guid = self._normalize_guid(chat_guid)
         params: dict[str, Any] = {
@@ -143,6 +196,10 @@ class BlueBubblesClient:
         if before is not None:
             params["before"] = before
         messages = await self._get(f"/chat/{chat_guid}/message", params=params)
+        if from_me:
+            # `handle` names the OTHER party even on outgoing messages, so matching it
+            # against the account owner's own address never hits. Use the flag instead.
+            return [m for m in messages if m.get("isFromMe")]
         if handle_address:
             messages = [
                 m
@@ -273,37 +330,172 @@ class BlueBubblesClient:
         after: int | None = None,
         before: int | None = None,
         handle_address: str | None = None,
+        from_me: bool = False,
     ) -> list[dict[str, Any]]:
+        """Search messages via ``POST /message/query``.
+
+        ``with`` deliberately omits ``chats``: that join is an INNER join and silently
+        drops messages belonging to no chat row — measured at 4.70% over a 30-day
+        window on a live server, and the dropped rows are real (SMS shortcodes, 2FA
+        senders, marketing). Resolve chat labels separately with
+        :meth:`resolve_message_chats`.
+
+        Note that ``message.text`` is the *stored* column. Messages whose body lives
+        only in ``attributedBody`` are invisible to a ``LIKE`` filter even though the
+        server backfills ``text`` via ``universalText()`` when serializing the
+        response, so an empty result is not proof of absence.
+        """
         body: dict[str, Any] = {
             "limit": limit,
             "offset": offset,
             "sort": sort,
-            "with": ["chats", "attachment"],
+            "with": ["attachment"],
         }
         if chat_guid:
             body["chatGuid"] = self._normalize_guid(chat_guid)
-        if after:
+        if after is not None:
             body["after"] = after
-        if before:
+        if before is not None:
             body["before"] = before
         where: list[dict[str, Any]] = []
         if query:
-            where.append(
-                {
-                    "statement": "message.text LIKE :query",
-                    "args": {"query": f"%{query}%"},
-                }
-            )
-        if handle_address:
-            where.append(
-                {
-                    "statement": "handle.id = :address",
-                    "args": {"address": handle_address},
-                }
-            )
+            where.append(_like_clause(query))
+        where.extend(_sender_clauses(handle_address, from_me))
         if where:
             body["where"] = where
         return await self._post("/message/query", json=body)
+
+    async def query_created_since(
+        self,
+        *,
+        since_ms: int,
+        limit: int,
+        chat_guid: str | None = None,
+        handle_address: str | None = None,
+        from_me: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Messages created strictly after ``since_ms`` (Unix ms), oldest first.
+
+        Matches and sorts on the *same* column, which is what makes a truncated page
+        resumable: the caller can always continue from the frontier without rewinding.
+
+        Pass ``limit + 1`` and let :func:`bb_mcp.cursor.advance_created` trim — that is
+        how truncation is detected.
+        """
+        body: dict[str, Any] = {
+            "limit": limit,
+            "offset": 0,
+            "sort": "ASC",
+            "with": ["attachment"],
+            "where": [
+                {
+                    "statement": "message.date > :createdAfter",
+                    "args": {"createdAfter": exclusive_apple_ns(since_ms)},
+                },
+                *_sender_clauses(handle_address, from_me),
+            ],
+        }
+        if chat_guid:
+            body["chatGuid"] = self._normalize_guid(chat_guid)
+        return await self._post("/message/query", json=body)
+
+    async def query_changed_since(
+        self,
+        *,
+        since_ms: int,
+        limit: int,
+        chat_guid: str | None = None,
+        handle_address: str | None = None,
+        from_me: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Messages edited or unsent strictly after ``since_ms`` (Unix ms).
+
+        There is no route that returns *updated* messages — ``after``/``before`` filter
+        ``message.date`` only, and ``applyMessageUpdateDateQuery`` is reachable solely
+        from ``GET /message/count/updated``, which returns a count. A raw ``where`` is
+        the only way to see edits and unsends.
+
+        The bind parameter is repeated across both references, which the server binds
+        correctly. It goes through :func:`changed_bind_ns` rather than
+        :func:`exclusive_apple_ns` because never-edited rows store ``0`` and a negative
+        bind would match every one of them.
+        """
+        body: dict[str, Any] = {
+            "limit": limit,
+            "offset": 0,
+            "sort": "ASC",
+            "with": ["attachment"],
+            "where": [
+                {
+                    "statement": (
+                        "(message.date_edited > :changedAfter"
+                        " OR message.date_retracted > :changedAfter)"
+                    ),
+                    "args": {"changedAfter": changed_bind_ns(since_ms)},
+                },
+                *_sender_clauses(handle_address, from_me),
+            ],
+        }
+        if chat_guid:
+            body["chatGuid"] = self._normalize_guid(chat_guid)
+        return await self._post("/message/query", json=body)
+
+    async def resolve_message_chats(
+        self, message_guids: Sequence[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Map message GUID -> its chats, for rows already fetched.
+
+        This is the second pass that replaces ``with: ["chats"]`` on the primary query.
+        GUIDs absent from the result have no chat row — the INNER join drops them — and
+        belong in the caller's explicit "no chat" bucket rather than vanishing.
+
+        Uses the TypeORM spread form ``IN (:...guids)``; a plain ``IN (:guids)`` is a
+        500. Returns ``{}`` without issuing a request for an empty input, since
+        ``limit=0`` is a 400 and ``IN ()`` is a syntax error.
+        """
+        unique = list(dict.fromkeys(g for g in message_guids if g))
+        if not unique:
+            return {}
+        chunks = [
+            unique[i : i + _GUID_CHUNK] for i in range(0, len(unique), _GUID_CHUNK)
+        ]
+        responses = await asyncio.gather(
+            *(self._resolve_chat_chunk(chunk) for chunk in chunks)
+        )
+        resolved: dict[str, list[dict[str, Any]]] = {}
+        for response in responses:
+            resolved.update(response)
+        return resolved
+
+    async def _resolve_chat_chunk(
+        self, guids: list[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        rows = await self._post(
+            "/message/query",
+            json={
+                "limit": _GUID_CHUNK,
+                "offset": 0,
+                "sort": "ASC",
+                "with": ["chat"],
+                "where": [
+                    {
+                        "statement": "message.guid IN (:...guids)",
+                        "args": {"guids": guids},
+                    }
+                ],
+            },
+        )
+        out: dict[str, list[dict[str, Any]]] = {}
+        for row in rows or []:
+            guid = row.get("guid")
+            if not guid:
+                continue
+            chats = row.get("chats")
+            if chats is None:
+                single = row.get("chat")
+                chats = [single] if isinstance(single, dict) else []
+            out[guid] = chats
+        return out
 
     async def get_message(self, message_guid: str) -> dict[str, Any]:
         return await self._get(

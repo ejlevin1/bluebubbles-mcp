@@ -9,7 +9,8 @@ import httpx
 import pytest
 import respx
 
-from bb_mcp.client import BlueBubblesClient, BlueBubblesError
+from bb_mcp.client import BlueBubblesClient, BlueBubblesError, escape_like
+from bb_mcp.cursor import changed_bind_ns, exclusive_apple_ns
 
 BASE_URL = "http://bb.local:1234"
 API = f"{BASE_URL}/api/v1"
@@ -502,7 +503,8 @@ class TestMessages:
         assert body["limit"] == 25
         assert body["offset"] == 0
         assert body["sort"] == "DESC"
-        assert body["with"] == ["chats", "attachment"]
+        # `chats` is an INNER join that silently drops ~4.7% of real messages.
+        assert body["with"] == ["attachment"]
         assert "where" not in body
         assert "chatGuid" not in body
 
@@ -530,6 +532,180 @@ class TestMessages:
         body = json.loads(route.calls[0].request.content)
         assert len(body["where"]) == 1
         assert body["where"][0]["args"]["address"] == "+15551234567"
+
+    def test_escape_like_covers_all_three_metacharacters(self) -> None:
+        assert escape_like(r"a%b_c\\d") == r"a\%b\_c\\\\d"
+
+    def test_escape_like_leaves_plain_text_alone(self) -> None:
+        assert escape_like("hello world") == "hello world"
+
+    async def test_search_messages_escapes_like_wildcards(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        # Unescaped, a query of `%` matches the entire table. Verified live: the
+        # escaped form of `_` returned 942 rows where the raw form returned all 1000.
+        route = mock_api.post(f"{API}/message/query").mock(return_value=ok_json([]))
+        await client.search_messages(query="100%_off")
+        import json
+
+        clause = json.loads(route.calls[0].request.content)["where"][0]
+        assert clause["args"]["query"] == r"%100\%\_off%"
+        assert clause["statement"] == r"message.text LIKE :query ESCAPE '\'"
+
+    async def test_search_messages_never_interpolates_the_term(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        # `statement` is concatenated into SQL verbatim; only `args` are bound.
+        route = mock_api.post(f"{API}/message/query").mock(return_value=ok_json([]))
+        await client.search_messages(query="x) OR (1=1")
+        import json
+
+        clause = json.loads(route.calls[0].request.content)["where"][0]
+        assert "1=1" not in clause["statement"]
+        assert "1=1" in clause["args"]["query"]
+
+    async def test_search_messages_from_me_uses_is_from_me(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.post(f"{API}/message/query").mock(return_value=ok_json([]))
+        await client.search_messages(from_me=True)
+        import json
+
+        clause = json.loads(route.calls[0].request.content)["where"][0]
+        assert clause["statement"] == "message.is_from_me = :fromMe"
+
+    async def test_search_messages_after_zero_is_not_dropped(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.post(f"{API}/message/query").mock(return_value=ok_json([]))
+        await client.search_messages(after=0)
+        import json
+
+        assert json.loads(route.calls[0].request.content)["after"] == 0
+
+    async def test_query_created_since_body(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.post(f"{API}/message/query").mock(return_value=ok_json([]))
+        await client.query_created_since(since_ms=1_700_000_000_000, limit=51)
+        import json
+
+        body = json.loads(route.calls[0].request.content)
+        # Matching and sorting on the same column is what makes truncation resumable.
+        assert body["sort"] == "ASC"
+        assert body["limit"] == 51
+        assert body["with"] == ["attachment"]
+        clause = body["where"][0]
+        assert clause["statement"] == "message.date > :createdAfter"
+        assert clause["args"]["createdAfter"] == exclusive_apple_ns(1_700_000_000_000)
+
+    async def test_query_created_since_scopes_to_a_chat(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.post(f"{API}/message/query").mock(return_value=ok_json([]))
+        await client.query_created_since(
+            since_ms=1, limit=5, chat_guid="iMessage;-;+15551234567"
+        )
+        import json
+
+        assert (
+            json.loads(route.calls[0].request.content)["chatGuid"]
+            == "any;-;+15551234567"
+        )
+
+    async def test_query_changed_since_covers_edits_and_retractions(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.post(f"{API}/message/query").mock(return_value=ok_json([]))
+        await client.query_changed_since(since_ms=1_700_000_000_000, limit=51)
+        import json
+
+        clause = json.loads(route.calls[0].request.content)["where"][0]
+        assert "message.date_edited > :changedAfter" in clause["statement"]
+        assert "message.date_retracted > :changedAfter" in clause["statement"]
+        # One repeated bind parameter across both references.
+        assert list(clause["args"]) == ["changedAfter"]
+        assert clause["args"]["changedAfter"] == changed_bind_ns(1_700_000_000_000)
+
+    async def test_query_changed_since_floors_the_bind_at_zero(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        # Never-edited rows store 0, and `0 > negative` is TRUE — a pre-2001 watermark
+        # would otherwise return every message ever sent. Verified live.
+        route = mock_api.post(f"{API}/message/query").mock(return_value=ok_json([]))
+        await client.query_changed_since(since_ms=0, limit=5)
+        import json
+
+        assert (
+            json.loads(route.calls[0].request.content)["where"][0]["args"][
+                "changedAfter"
+            ]
+            == 0
+        )
+
+    async def test_resolve_message_chats_uses_the_spread_form(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        # A plain `IN (:guids)` is a 500 on the server.
+        route = mock_api.post(f"{API}/message/query").mock(
+            return_value=ok_json([{"guid": "m1", "chats": [{"guid": "c1"}]}])
+        )
+        result = await client.resolve_message_chats(["m1", "m2"])
+        import json
+
+        body = json.loads(route.calls[0].request.content)
+        assert body["with"] == ["chat"]
+        assert body["where"][0]["statement"] == "message.guid IN (:...guids)"
+        assert body["where"][0]["args"]["guids"] == ["m1", "m2"]
+        # m2 was dropped by the INNER join; it belongs in the caller's no-chat bucket.
+        assert result == {"m1": [{"guid": "c1"}]}
+
+    async def test_resolve_message_chats_skips_the_request_when_empty(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        # limit=0 is a 400 and `IN ()` is a syntax error.
+        route = mock_api.post(f"{API}/message/query").mock(return_value=ok_json([]))
+        assert await client.resolve_message_chats([]) == {}
+        assert not route.called
+
+    async def test_resolve_message_chats_deduplicates(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.post(f"{API}/message/query").mock(return_value=ok_json([]))
+        await client.resolve_message_chats(["m1", "m1", "", "m2"])
+        import json
+
+        assert json.loads(route.calls[0].request.content)["where"][0]["args"][
+            "guids"
+        ] == [
+            "m1",
+            "m2",
+        ]
+
+    async def test_resolve_message_chats_chunks_large_inputs(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.post(f"{API}/message/query").mock(return_value=ok_json([]))
+        await client.resolve_message_chats([f"m{i}" for i in range(900)])
+        assert route.call_count == 3
+
+    async def test_get_chat_messages_from_me_filters_on_the_flag(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        mock_api.get(f"{API}/chat/g1/message").mock(
+            return_value=ok_json(
+                [
+                    {"guid": "mine", "isFromMe": True, "handle": {"address": "+1555"}},
+                    {
+                        "guid": "theirs",
+                        "isFromMe": False,
+                        "handle": {"address": "+1555"},
+                    },
+                ]
+            )
+        )
+        result = await client.get_chat_messages("g1", from_me=True)
+        assert [m["guid"] for m in result] == ["mine"]
 
     async def test_get_message(
         self, client: BlueBubblesClient, mock_api: respx.Router

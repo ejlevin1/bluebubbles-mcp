@@ -288,27 +288,51 @@ async def test_messages(
                 "get_chat_messages ASC sort is oldest-first",
             )
 
-    # --- get_recent_messages ---
-    recent = _data(
+    # --- get_recent_messages (incremental polling) ---
+    poll = _data(
         await c.call_tool("get_recent_messages", {"minutes": 10080, "limit": 20})
     )
     s.check(
-        isinstance(recent, list),
-        f"get_recent_messages returns list ({len(recent)} messages)",
+        isinstance(poll, dict) and "cursor" in poll and "messages" in poll,
+        f"get_recent_messages returns an envelope ({len(poll.get('messages', []))} messages)",
     )
+    recent = poll.get("messages", [])
     if not first_msg_guid and recent:
         first_msg_guid = _first_message_guid(recent)
     if not first_att_guid and recent:
         first_att_guid = _first_attachment_guid(recent)
+
+    # The whole point of the cursor: a second poll must not re-deliver what the first
+    # one already returned.
+    second = _data(await c.call_tool("get_recent_messages", {"since": poll["cursor"]}))
+    repeats = {m["guid"] for m in recent} & {m["guid"] for m in second.get("messages", [])}
+    s.check(
+        not repeats,
+        "get_recent_messages(since=cursor) returns no duplicates",
+        f"{len(repeats)} message(s) re-delivered",
+    )
+    s.check(
+        second["cursor"] != poll["cursor"] or not second["cursor_advanced"],
+        "cursor either advances or reports that it did not",
+    )
+
+    bad_cursor = await c.call_tool(
+        "get_recent_messages", {"since": "not-a-cursor"}, raise_on_error=False
+    )
+    s.check(
+        bad_cursor.is_error,
+        "get_recent_messages rejects a malformed cursor instead of silently reseeding",
+    )
 
     recent_me = _data(
         await c.call_tool(
             "get_recent_messages", {"minutes": 10080, "limit": 20, "from_address": "me"}
         )
     )
+    mine = recent_me.get("messages", [])
     s.check(
-        isinstance(recent_me, list),
-        f"get_recent_messages(from_address='me') returns list ({len(recent_me)} messages)",
+        all(m.get("isFromMe") for m in mine),
+        f"get_recent_messages(from_address='me') returns only outgoing ({len(mine)})",
     )
 
     # --- search_messages ---
