@@ -144,6 +144,28 @@ just setup   # installs deps and git hooks
 | `delete_chat` | Delete a conversation | destructive, open-world |
 | `delete_scheduled_message` | Cancel scheduled message | destructive, open-world |
 
+## Testing
+
+```bash
+just test               # unit tests, no server needed
+just test-integration   # read-only against a live server (skips without .env)
+just e2e                # end-to-end through the MCP tool layer, read-only
+```
+
+Integration tests skip themselves when `BLUEBUBBLES_URL` / `BLUEBUBBLES_PASSWORD` are
+absent, so CI runs them as no-ops.
+
+A small number of integration tests **send real messages** to verify the polling cursor
+against a message that did not exist when the cursor was issued. They are gated on
+`TEST_WRITE_GUID` (see `.env.example`) and skip entirely when it is unset. Without the
+Private API a sent message cannot be unsent, so point that variable at a chat you own —
+texting your own number gives you a self-thread that works well. To exclude them
+explicitly regardless of environment:
+
+```bash
+uv run pytest tests/integration -m "not write"
+```
+
 ## Polling for new messages
 
 `get_recent_messages` returns a cursor. Pass it back as `since` on the next call and you
