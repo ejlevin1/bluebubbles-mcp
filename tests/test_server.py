@@ -302,6 +302,32 @@ class TestGetChatMessages:
         assert [m["guid"] for m in result.data] == ["a"]
 
 
+class TestVersion:
+    async def test_server_reports_its_own_version_not_fastmcps(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        # A client needs this to tell which build it is talking to: uvx caches by URL
+        # and will happily serve a stale one from a branch that has moved on.
+        from bb_mcp import __version__
+        from bb_mcp.server import mcp
+
+        assert mcp.version == __version__
+
+    def test_version_matches_pyproject(self) -> None:
+        """The declared version and the importable one must not drift."""
+        import tomllib
+        from pathlib import Path
+
+        from bb_mcp import __version__
+
+        pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        declared = tomllib.loads(pyproject.read_text())["project"]["version"]
+        assert __version__ == declared, (
+            f"pyproject declares {declared} but the installed package is "
+            f"{__version__}; run `uv sync` or bump one to match"
+        )
+
+
 class TestGetRecentMessages:
     """The incremental polling envelope."""
 

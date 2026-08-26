@@ -15,6 +15,7 @@ from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.types import Image
 from mcp.types import ToolAnnotations
 
+from bb_mcp import __version__
 from bb_mcp.client import BlueBubblesClient
 from bb_mcp.cursor import (
     MAX_PAGE,
@@ -122,6 +123,7 @@ async def lifespan(server: FastMCP):
 
 mcp = FastMCP(
     "BlueBubbles",
+    version=__version__,
     instructions=(
         "Use this server for anything involving iMessage or SMS text messages on the user's "
         "Apple iPhone or Mac. It bridges the user's real personal messaging via BlueBubbles.\n\n"
