@@ -707,6 +707,29 @@ class TestMessages:
         result = await client.get_chat_messages("g1", from_me=True)
         assert [m["guid"] for m in result] == ["mine"]
 
+    async def test_create_scheduled_message_uses_the_nested_envelope(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        # A flat {chatGuid, message, scheduledFor} body is rejected by the server with
+        # "The type field is required." — this route does not take the same shape as
+        # the other send routes.
+        route = mock_api.post(f"{API}/message/schedule").mock(return_value=ok_json({}))
+        await client.create_scheduled_message(
+            "iMessage;-;+15551234567", "hi", 1_800_000_000_000
+        )
+        import json
+
+        body = json.loads(route.calls[0].request.content)
+        assert body["type"] == "send-message"
+        assert body["schedule"] == {"type": "once"}
+        assert body["scheduledFor"] == 1_800_000_000_000
+        assert body["payload"] == {
+            "chatGuid": "any;-;+15551234567",
+            "message": "hi",
+            "method": "apple-script",
+        }
+        assert "chatGuid" not in body, "the flat shape is what the server rejects"
+
     async def test_get_message(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
@@ -853,10 +876,13 @@ class TestScheduledMessages:
         import json
 
         body = json.loads(route.calls[0].request.content)
-        assert body["chatGuid"] == "g1"
-        assert body["message"] == "Hello later"
+        # The flat shape this test used to assert is what the server rejects with
+        # "The type field is required."
+        assert body["type"] == "send-message"
+        assert body["payload"]["chatGuid"] == "g1"
+        assert body["payload"]["message"] == "Hello later"
         assert body["scheduledFor"] == 1700000000
-        assert body["tempGuid"].startswith("temp-")
+        assert body["schedule"] == {"type": "once"}
 
     async def test_delete_scheduled_message(
         self, client: BlueBubblesClient, mock_api: respx.Router

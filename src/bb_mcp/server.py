@@ -75,6 +75,12 @@ PRIVATE_API_TOOLS = [
     "send_attachment",
     "check_imessage",
     "check_facetime",
+    # Read receipts go out over the Private API too. Without it the server answers
+    # `POST /chat/:guid/read` with a 500 whose body reads "iMessage Private API is
+    # not enabled!" — so advertising these would offer an agent a tool that cannot
+    # work, on any chat.
+    "mark_chat_read",
+    "mark_chat_unread",
 ]
 
 

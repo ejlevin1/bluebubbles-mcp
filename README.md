@@ -108,6 +108,10 @@ just setup   # installs deps and git hooks
 
 ## Tools
 
+Tools marked **Private API** are removed from the tool list at startup when the
+BlueBubbles server reports `private_api: false`, so a client only ever sees tools that
+can actually run.
+
 | Tool | Description | Annotations |
 |------|-------------|-------------|
 | `ping` | Check server connectivity | read-only |
@@ -126,8 +130,8 @@ just setup   # installs deps and git hooks
 | `get_unread_chats` | Chats with unread messages + their latest messages | read-only |
 | `get_attachment_info` | Attachment metadata | read-only |
 | `download_attachment` | Download attachment as base64 | read-only |
-| `mark_chat_read` | Send read receipt | idempotent, open-world |
-| `mark_chat_unread` | Mark chat unread (local) | idempotent |
+| `mark_chat_read` | Send read receipt | idempotent, open-world, **Private API** |
+| `mark_chat_unread` | Mark chat unread | idempotent, **Private API** |
 | `rename_group` | Rename a group chat | idempotent |
 | `start_typing` | Show typing indicator | open-world |
 | `stop_typing` | Stop typing indicator | open-world |

@@ -957,6 +957,21 @@ class TestLeaveChat:
 # ---------------------------------------------------------------------------
 
 
+class TestReadReceiptsNeedPrivateApi:
+    """Read receipts go out over the Private API.
+
+    Without it the server answers `POST /chat/:guid/read` with a 500 reading
+    "iMessage Private API is not enabled!" — on every chat, not just some. Offering
+    the tool anyway hands an agent a call that cannot possibly succeed.
+    """
+
+    def test_listed_as_private_api_tools(self) -> None:
+        from bb_mcp.server import PRIVATE_API_TOOLS
+
+        assert "mark_chat_read" in PRIVATE_API_TOOLS
+        assert "mark_chat_unread" in PRIVATE_API_TOOLS
+
+
 class TestPrivateApiDisabled:
     @pytest.fixture
     async def no_api_client(self, bb_env: None) -> AsyncGenerator[Client, None]:
@@ -990,6 +1005,18 @@ class TestPrivateApiDisabled:
             "unsend_message",
             {"message_guid": "m1"},
             raise_on_error=False,
+        )
+        assert result.is_error
+
+    async def test_mark_chat_read_removed(self, no_api_client: Client) -> None:
+        result = await no_api_client.call_tool(
+            "mark_chat_read", {"chat_guid": "g1"}, raise_on_error=False
+        )
+        assert result.is_error
+
+    async def test_mark_chat_unread_removed(self, no_api_client: Client) -> None:
+        result = await no_api_client.call_tool(
+            "mark_chat_unread", {"chat_guid": "g1"}, raise_on_error=False
         )
         assert result.is_error
 

@@ -571,12 +571,23 @@ class BlueBubblesClient:
         chat_guid: str,
         message: str,
         scheduled_for: int,
+        method: str = "apple-script",
     ) -> dict[str, Any]:
+        """Schedule a one-off message.
+
+        The route wants a nested envelope, not the flat body the other send routes
+        take: a bare ``{chatGuid, message, scheduledFor}`` is rejected outright with
+        "The type field is required."
+        """
         body: dict[str, Any] = {
-            "chatGuid": self._normalize_guid(chat_guid),
-            "message": message,
+            "type": "send-message",
+            "payload": {
+                "chatGuid": self._normalize_guid(chat_guid),
+                "message": message,
+                "method": method,
+            },
             "scheduledFor": scheduled_for,
-            "tempGuid": f"temp-{uuid.uuid4().hex}",
+            "schedule": {"type": "once"},
         }
         return await self._post("/message/schedule", json=body)
 

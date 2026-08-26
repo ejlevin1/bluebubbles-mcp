@@ -267,12 +267,12 @@ async def test_messages(
             isinstance(msgs_me, list),
             f"get_chat_messages(from_address='me') returns list ({len(msgs_me)} messages)",
         )
-        bad = [
-            m for m in msgs_me if (m.get("handle") or {}).get("address") != my_address
-        ]
+        # `handle` names the OTHER party even on outgoing messages, so the user's own
+        # address never appears there. `isFromMe` is the only reliable signal.
+        bad = [m for m in msgs_me if not m.get("isFromMe")]
         s.check(
             len(bad) == 0,
-            "get_chat_messages(from_address='me') all messages match user address",
+            "get_chat_messages(from_address='me') returns only outgoing messages",
             f"{len(bad)} messages with unexpected handle",
         )
 
@@ -305,7 +305,9 @@ async def test_messages(
     # The whole point of the cursor: a second poll must not re-deliver what the first
     # one already returned.
     second = _data(await c.call_tool("get_recent_messages", {"since": poll["cursor"]}))
-    repeats = {m["guid"] for m in recent} & {m["guid"] for m in second.get("messages", [])}
+    repeats = {m["guid"] for m in recent} & {
+        m["guid"] for m in second.get("messages", [])
+    }
     s.check(
         not repeats,
         "get_recent_messages(since=cursor) returns no duplicates",
