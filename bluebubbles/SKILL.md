@@ -65,6 +65,16 @@ For memory format, storage criteria, and group chat mappings — see [references
 
 ## Core Workflows
 
+### Follow a conversation over time
+```
+get_recent_messages(minutes=60)           → first call; seeds the window
+  ...then on every subsequent call:
+get_recent_messages(since=<cursor>)       → only what is new or changed, no duplicates
+  → pass the returned `cursor` back VERBATIM; never construct one
+  → if has_more is true, call again IMMEDIATELY (there is a backlog)
+  → `changed` holds edits and unsends of older messages; `messages` holds new ones
+```
+
 ### Check messages
 ```
 List(memory://user/relationships/)        → recall known contacts
@@ -120,8 +130,17 @@ GUIDs identify conversations. The format encodes the chat type:
 ## Decision Tree
 
 ```
-User wants to check messages?
+User wants to check for NEW messages since last time, or follow a conversation?
+  → get_recent_messages(since=<cursor from the last response>)
+  → First call in a session: get_recent_messages(minutes=N)
+  → Pass the returned `cursor` back verbatim; if has_more is true, call again at once
+  → This is the ONLY way to see edits and unsends of older messages
+
+User wants a snapshot of what is unread right now?
   → get_unread_chats (messages already included)
+  → NOTE: unread is the USER's read state, not yours. It flips when they read on their
+    phone, so it is not a substitute for a cursor. A message you already handled can
+    still be unread; one you have never seen can already be read.
   → Resolve contacts: memory first, then batch lookup_contact for unknowns
   → Store any newly resolved frequent contacts to memory
   → Never call get_chat_messages unless user wants MORE history

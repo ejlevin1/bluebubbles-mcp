@@ -11,10 +11,15 @@ import pytest
 import respx
 from fastmcp import Client
 
+from bb_mcp.cursor import MAX_PAGE, Cursor
+
 BASE_URL = "http://bb.local:1234"
 API = f"{BASE_URL}/api/v1"
 PASSWORD = "test-secret"
 MY_ADDRESS = "+15550000000"
+
+#: Tests seed cursors well in the past, so any "now" newer than the fixtures works.
+NOW_MS = 4_000_000_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -26,7 +31,9 @@ def ok_json(data: Any = None) -> httpx.Response:
     return httpx.Response(200, json={"status": 200, "data": data})
 
 
-def server_info_ok(private_api: bool = True, address: str = MY_ADDRESS) -> httpx.Response:
+def server_info_ok(
+    private_api: bool = True, address: str = MY_ADDRESS
+) -> httpx.Response:
     return ok_json(
         {
             "private_api": private_api,
@@ -135,7 +142,9 @@ async def mcp_client(bb_env: None) -> AsyncGenerator[tuple[Client, respx.Router]
     from bb_mcp.server import mcp
 
     with respx.mock(assert_all_called=False) as router:
-        router.get(f"{API}/server/info").mock(return_value=server_info_ok(private_api=True))
+        router.get(f"{API}/server/info").mock(
+            return_value=server_info_ok(private_api=True)
+        )
         async with Client(mcp) as client:
             yield client, router
 
@@ -159,7 +168,11 @@ class TestGetMyAddress:
         with respx.mock(assert_all_called=False) as router:
             router.get(f"{API}/server/info").mock(
                 return_value=ok_json(
-                    {"private_api": True, "detected_imessage": None, "detected_icloud": None}
+                    {
+                        "private_api": True,
+                        "detected_imessage": None,
+                        "detected_icloud": None,
+                    }
                 )
             )
             async with Client(mcp) as c:
@@ -179,7 +192,9 @@ class TestGetServerInfo:
 
 
 class TestPing:
-    async def test_returns_result(self, mcp_client: tuple[Client, respx.Router]) -> None:
+    async def test_returns_result(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
         c, router = mcp_client
         router.get(f"{API}/ping").mock(return_value=ok_json("pong"))
         result = await c.call_tool("ping", {})
@@ -203,7 +218,9 @@ class TestListChats:
 
 
 class TestGetChat:
-    async def test_returns_chat_dict(self, mcp_client: tuple[Client, respx.Router]) -> None:
+    async def test_returns_chat_dict(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
         c, router = mcp_client
         router.get(f"{API}/chat/any;-;+1555").mock(
             return_value=ok_json({"guid": "iMessage;-;+1555", "participants": []})
@@ -239,19 +256,24 @@ class TestGetChatMessages:
         )
         assert result.data[0]["originalROWID"] == 1
 
-    async def test_from_address_me_filters_client_side(
+    async def test_from_address_me_filters_on_is_from_me(
         self, mcp_client: tuple[Client, respx.Router]
     ) -> None:
+        # `handle` names the OTHER party even on outgoing messages, so matching it
+        # against the owner's own address finds nothing. Verified against a live
+        # server: 0 rows returned where 85 of 200 messages were in fact outgoing.
         c, router = mcp_client
         router.get(f"{API}/chat/g1/message").mock(
             return_value=ok_json(
                 [
                     {
-                        "guid": "m1",
-                        "handle": {"address": MY_ADDRESS, "service": "iMessage"},
+                        "guid": "mine",
+                        "isFromMe": True,
+                        "handle": {"address": "+15559999999", "service": "iMessage"},
                     },
                     {
-                        "guid": "m2",
+                        "guid": "theirs",
+                        "isFromMe": False,
                         "handle": {"address": "+15559999999", "service": "iMessage"},
                     },
                 ]
@@ -260,41 +282,309 @@ class TestGetChatMessages:
         result = await c.call_tool(
             "get_chat_messages", {"chat_guid": "g1", "from_address": "me"}
         )
-        assert len(result.data) == 1
-        assert result.data[0]["guid"] == "m1"
+        assert [m["guid"] for m in result.data] == ["mine"]
 
-
-class TestGetRecentMessages:
-    async def test_returns_slim_list(self, mcp_client: tuple[Client, respx.Router]) -> None:
-        c, router = mcp_client
-        router.post(f"{API}/message/query").mock(
-            return_value=ok_json([{"guid": "m1", "text": "hey", "originalROWID": 5}])
-        )
-        result = await c.call_tool("get_recent_messages", {"minutes": 60})
-        assert isinstance(result.data, list)
-        assert "originalROWID" not in result.data[0]
-
-    async def test_extended_passes_through(
+    async def test_from_address_other_still_filters_by_handle(
         self, mcp_client: tuple[Client, respx.Router]
     ) -> None:
         c, router = mcp_client
-        router.post(f"{API}/message/query").mock(
-            return_value=ok_json([{"guid": "m1", "originalROWID": 5}])
+        router.get(f"{API}/chat/g1/message").mock(
+            return_value=ok_json(
+                [
+                    {"guid": "a", "handle": {"address": "+15551112222"}},
+                    {"guid": "b", "handle": {"address": "+15559999999"}},
+                ]
+            )
+        )
+        result = await c.call_tool(
+            "get_chat_messages", {"chat_guid": "g1", "from_address": "+15551112222"}
+        )
+        assert [m["guid"] for m in result.data] == ["a"]
+
+
+class TestVersion:
+    async def test_server_reports_its_own_version_not_fastmcps(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        # A client needs this to tell which build it is talking to: uvx caches by URL
+        # and will happily serve a stale one from a branch that has moved on.
+        from bb_mcp import __version__
+        from bb_mcp.server import mcp
+
+        assert mcp.version == __version__
+
+    def test_version_matches_pyproject(self) -> None:
+        """The declared version and the importable one must not drift."""
+        import tomllib
+        from pathlib import Path
+
+        from bb_mcp import __version__
+
+        pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        declared = tomllib.loads(pyproject.read_text())["project"]["version"]
+        assert __version__ == declared, (
+            f"pyproject declares {declared} but the installed package is "
+            f"{__version__}; run `uv sync` or bump one to match"
+        )
+
+
+class TestGetRecentMessages:
+    """The incremental polling envelope."""
+
+    def _routes(
+        self, router: respx.Router, created: list[dict], changed: list[dict]
+    ) -> None:
+        """Route the two axes apart by inspecting the outgoing where-clause."""
+        import json as _json
+
+        def dispatch(request: httpx.Request) -> httpx.Response:
+            body = _json.loads(request.content)
+            statements = " ".join(w["statement"] for w in body.get("where", []))
+            if "message.guid IN" in statements:
+                return ok_json([])  # chat resolution
+            if "date_edited" in statements:
+                return ok_json(changed)
+            return ok_json(created)
+
+        router.post(f"{API}/message/query").mock(side_effect=dispatch)
+
+    async def test_returns_an_envelope_not_a_bare_list(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        c, router = mcp_client
+        self._routes(router, [{"guid": "m1", "text": "hey", "dateCreated": 1000}], [])
+        result = await c.call_tool("get_recent_messages", {"minutes": 60})
+        assert set(result.data) >= {
+            "messages",
+            "changed",
+            "reactions",
+            "cursor",
+            "has_more",
+            "cursor_advanced",
+            "counts",
+            "notes",
+        }
+        assert [m["guid"] for m in result.data["messages"]] == ["m1"]
+
+    async def test_messages_are_slim_by_default(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        c, router = mcp_client
+        self._routes(
+            router, [{"guid": "m1", "dateCreated": 1000, "originalROWID": 5}], []
+        )
+        result = await c.call_tool("get_recent_messages", {"minutes": 60})
+        assert "originalROWID" not in result.data["messages"][0]
+
+    async def test_extended_passes_raw_rows_through(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        c, router = mcp_client
+        self._routes(
+            router, [{"guid": "m1", "dateCreated": 1000, "originalROWID": 5}], []
         )
         result = await c.call_tool(
             "get_recent_messages", {"minutes": 60, "extended": True}
         )
-        assert result.data[0]["originalROWID"] == 5
+        assert result.data["messages"][0]["originalROWID"] == 5
 
-    async def test_from_address_me_resolves(
+    async def test_cursor_round_trips_through_the_tool(
         self, mcp_client: tuple[Client, respx.Router]
     ) -> None:
         c, router = mcp_client
-        router.post(f"{API}/message/query").mock(return_value=ok_json([]))
-        result = await c.call_tool(
-            "get_recent_messages", {"minutes": 60, "from_address": "me"}
+        self._routes(router, [{"guid": "m1", "dateCreated": 1_700_000_000_000}], [])
+        seed = Cursor.seed(1).encode()
+        first = (await c.call_tool("get_recent_messages", {"since": seed})).data
+        second = await c.call_tool(
+            "get_recent_messages", {"since": first["cursor"]}, raise_on_error=False
         )
-        assert isinstance(result.data, list)
+        assert not second.is_error
+        assert (
+            Cursor.parse(first["cursor"], now_ms=NOW_MS).created_ms == 1_700_000_000_000
+        )
+
+    async def test_since_wins_over_minutes_and_says_so(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        c, router = mcp_client
+        self._routes(router, [], [])
+        token = Cursor.seed(1_700_000_000_000).encode()
+        result = await c.call_tool(
+            "get_recent_messages", {"since": token, "minutes": 5}
+        )
+        assert any("minutes" in n for n in result.data["notes"])
+
+    async def test_malformed_since_errors_instead_of_scanning_everything(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        c, router = mcp_client
+        self._routes(router, [], [])
+        result = await c.call_tool(
+            "get_recent_messages", {"since": "made-up"}, raise_on_error=False
+        )
+        assert result.is_error
+
+    async def test_from_address_me_uses_is_from_me_clause(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        import json as _json
+
+        c, router = mcp_client
+        self._routes(router, [], [])
+        await c.call_tool("get_recent_messages", {"minutes": 60, "from_address": "me"})
+        statements = [
+            w["statement"]
+            for call in router.calls
+            if call.request.method == "POST"
+            for w in _json.loads(call.request.content).get("where", [])
+        ]
+        assert any("message.is_from_me" in s for s in statements)
+        assert not any("handle.id" in s for s in statements)
+
+    async def test_old_edits_do_not_hide_a_new_message(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        """The reason there are two watermarks rather than one.
+
+        Ten years-old messages edited moments ago sort near the FRONT by
+        message.date. Under a single shared cursor the frontier trim discards the one
+        genuinely new message and the cursor lands behind where the poll started, so
+        the next poll returns the identical batch and the new message is unreachable
+        forever.
+        """
+        c, router = mcp_client
+        old_edited = [
+            {
+                "guid": f"old{i}",
+                "dateCreated": 1_000 + i,
+                "dateEdited": 1_700_000_000_000,
+            }
+            for i in range(10)
+        ]
+        brand_new = [{"guid": "new", "dateCreated": 1_700_000_000_500}]
+        self._routes(router, brand_new, old_edited)
+
+        seed = Cursor.seed(999).encode()
+        result = (
+            await c.call_tool("get_recent_messages", {"since": seed, "limit": 10})
+        ).data
+
+        assert "new" in [m["guid"] for m in result["messages"]]
+        assert result["cursor_advanced"]
+        assert (
+            Cursor.parse(result["cursor"], now_ms=NOW_MS).created_ms
+            == 1_700_000_000_500
+        )
+        assert len(result["changed"]) == 10
+
+    async def test_shared_millisecond_truncation_skips_nothing(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        c, router = mcp_client
+        rows = [
+            {"guid": "a", "dateCreated": 100},
+            {"guid": "b", "dateCreated": 200},
+            {"guid": "c", "dateCreated": 200},
+        ]
+        self._routes(router, rows, [])
+        seed = Cursor.seed(1).encode()
+        result = (
+            await c.call_tool("get_recent_messages", {"since": seed, "limit": 2})
+        ).data
+        # The 200-block is held back rather than half-delivered and then excluded.
+        assert [m["guid"] for m in result["messages"]] == ["a"]
+        assert result["has_more"]
+        assert Cursor.parse(result["cursor"], now_ms=NOW_MS).created_ms == 100
+
+    async def test_batch_inside_one_millisecond_escalates_and_advances(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        # A truncated page entirely inside one millisecond cannot advance without
+        # either skipping rows or re-fetching. Retrying at the largest page the server
+        # allows resolves it: we then hold the whole millisecond, so excluding it is
+        # safe.
+        c, router = mcp_client
+        rows = [{"guid": g, "dateCreated": 500} for g in ("a", "b", "c")]
+        self._routes(router, rows, [])
+        seed = Cursor.seed(1).encode()
+        result = (
+            await c.call_tool("get_recent_messages", {"since": seed, "limit": 2})
+        ).data
+        assert len(result["messages"]) == 3, "the batch must not come back empty"
+        assert result["stalled_ms"] is None
+        assert Cursor.parse(result["cursor"], now_ms=NOW_MS).created_ms == 500
+
+    async def test_unresolvable_millisecond_stall_is_reported_not_hidden(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        # More rows share one millisecond than even the maximum page can hold. The
+        # cursor steps back so nothing is lost, and the stall is stated outright
+        # rather than returned as a silently non-advancing cursor.
+        c, router = mcp_client
+        rows = [{"guid": f"m{i}", "dateCreated": 500} for i in range(MAX_PAGE + 1)]
+        self._routes(router, rows, [])
+        seed = Cursor.seed(1).encode()
+        result = (
+            await c.call_tool("get_recent_messages", {"since": seed, "limit": 5})
+        ).data
+        assert result["stalled_ms"] == 500
+        assert result["has_more"]
+        assert any("share millisecond" in n for n in result["notes"])
+        assert Cursor.parse(result["cursor"], now_ms=NOW_MS).created_ms == 499
+
+    async def test_reactions_surface_with_stripped_targets(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        c, router = mcp_client
+        self._routes(
+            router,
+            [
+                {
+                    "guid": "r1",
+                    "dateCreated": 100,
+                    "associatedMessageGuid": "p:3/TARGET",
+                    "associatedMessageType": "love",
+                }
+            ],
+            [],
+        )
+        result = (await c.call_tool("get_recent_messages", {"minutes": 60})).data
+        assert result["reactions"][0]["target_guid"] == "TARGET"
+        assert result["reactions"][0]["type"] == "love"
+
+    async def test_unattributed_rows_get_an_empty_chat_list(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        # The INNER join drops 2FA senders and shortcodes; they must arrive with an
+        # explicit empty bucket rather than vanishing from the results.
+        c, router = mcp_client
+        self._routes(router, [{"guid": "m1", "dateCreated": 100}], [])
+        result = (await c.call_tool("get_recent_messages", {"minutes": 60})).data
+        assert result["messages"][0]["chats"] == []
+        assert result["counts"]["no_chat"] == 1
+
+    async def test_chat_resolution_failure_still_returns_a_cursor(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        import json as _json
+
+        c, router = mcp_client
+
+        def dispatch(request: httpx.Request) -> httpx.Response:
+            body = _json.loads(request.content)
+            statements = " ".join(w["statement"] for w in body.get("where", []))
+            if "message.guid IN" in statements:
+                return httpx.Response(500, json={"status": 500, "message": "boom"})
+            if "date_edited" in statements:
+                return ok_json([])
+            return ok_json([{"guid": "m1", "dateCreated": 100}])
+
+        router.post(f"{API}/message/query").mock(side_effect=dispatch)
+        result = (await c.call_tool("get_recent_messages", {"minutes": 60})).data
+        # Losing the cursor would make the caller replay the same window forever.
+        assert result["cursor"]
+        assert result["messages"][0]["guid"] == "m1"
+        assert any("attribution" in n for n in result["notes"])
 
 
 class TestGetUnreadChats:
@@ -368,7 +658,9 @@ class TestDeleteChat:
 
 
 class TestSearchMessages:
-    async def test_returns_slim_list(self, mcp_client: tuple[Client, respx.Router]) -> None:
+    async def test_returns_slim_list(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
         c, router = mcp_client
         router.post(f"{API}/message/query").mock(
             return_value=ok_json([{"guid": "m1", "text": "hello", "originalROWID": 3}])
@@ -397,7 +689,9 @@ class TestSearchMessages:
 
 
 class TestGetMessage:
-    async def test_slim_by_default(self, mcp_client: tuple[Client, respx.Router]) -> None:
+    async def test_slim_by_default(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
         c, router = mcp_client
         router.get(f"{API}/message/m1").mock(
             return_value=ok_json({"guid": "m1", "text": "hi", "originalROWID": 7})
@@ -663,6 +957,21 @@ class TestLeaveChat:
 # ---------------------------------------------------------------------------
 
 
+class TestReadReceiptsNeedPrivateApi:
+    """Read receipts go out over the Private API.
+
+    Without it the server answers `POST /chat/:guid/read` with a 500 reading
+    "iMessage Private API is not enabled!" — on every chat, not just some. Offering
+    the tool anyway hands an agent a call that cannot possibly succeed.
+    """
+
+    def test_listed_as_private_api_tools(self) -> None:
+        from bb_mcp.server import PRIVATE_API_TOOLS
+
+        assert "mark_chat_read" in PRIVATE_API_TOOLS
+        assert "mark_chat_unread" in PRIVATE_API_TOOLS
+
+
 class TestPrivateApiDisabled:
     @pytest.fixture
     async def no_api_client(self, bb_env: None) -> AsyncGenerator[Client, None]:
@@ -685,19 +994,35 @@ class TestPrivateApiDisabled:
 
     async def test_edit_message_removed(self, no_api_client: Client) -> None:
         result = await no_api_client.call_tool(
-            "edit_message", {"message_guid": "m1", "new_text": "edited"},
+            "edit_message",
+            {"message_guid": "m1", "new_text": "edited"},
             raise_on_error=False,
         )
         assert result.is_error
 
     async def test_unsend_message_removed(self, no_api_client: Client) -> None:
         result = await no_api_client.call_tool(
-            "unsend_message", {"message_guid": "m1"},
+            "unsend_message",
+            {"message_guid": "m1"},
             raise_on_error=False,
         )
         assert result.is_error
 
-    async def test_send_message_reply_to_guid_raises(self, no_api_client: Client) -> None:
+    async def test_mark_chat_read_removed(self, no_api_client: Client) -> None:
+        result = await no_api_client.call_tool(
+            "mark_chat_read", {"chat_guid": "g1"}, raise_on_error=False
+        )
+        assert result.is_error
+
+    async def test_mark_chat_unread_removed(self, no_api_client: Client) -> None:
+        result = await no_api_client.call_tool(
+            "mark_chat_unread", {"chat_guid": "g1"}, raise_on_error=False
+        )
+        assert result.is_error
+
+    async def test_send_message_reply_to_guid_raises(
+        self, no_api_client: Client
+    ) -> None:
         with respx.mock(assert_all_called=False) as router:
             router.post(f"{API}/message/text").mock(return_value=ok_json({"guid": "x"}))
             result = await no_api_client.call_tool(

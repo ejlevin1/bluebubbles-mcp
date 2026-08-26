@@ -39,8 +39,6 @@ ALWAYS_PRESENT = [
     "send_message",
     "send_message_to_address",
     "schedule_message",
-    "mark_chat_read",
-    "mark_chat_unread",
     "get_contacts",
     "lookup_contact",
     "rename_group",
@@ -63,6 +61,8 @@ PRIVATE_API_ONLY = [
     "send_attachment",
     "check_imessage",
     "check_facetime",
+    "mark_chat_read",
+    "mark_chat_unread",
 ]
 
 
