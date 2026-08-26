@@ -90,8 +90,11 @@ class TestInternalGet:
     async def test_get_http_error_raises(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
+        # BlueBubblesError rather than httpx.HTTPStatusError: httpx renders the full
+        # request URL into its message, and this API puts the password in the query
+        # string.
         mock_api.get(f"{API}/fail").mock(return_value=httpx.Response(500))
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(BlueBubblesError):
             await client._get("/fail")
 
     async def test_get_api_error_raises(
@@ -741,6 +744,105 @@ class TestMessages:
 
 
 # ===========================================================================
+# HTTP error handling
+# ===========================================================================
+
+
+class TestHttpErrors:
+    """4xx/5xx must not leak the credential and must say what went wrong."""
+
+    async def test_password_never_appears_in_the_error(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        # This API authenticates with a `password` query parameter, and httpx's
+        # raise_for_status() builds its message from the full request URL — so the
+        # server credential used to land in the exception text, which MCP surfaces to
+        # the model and writes to logs. Note the URL-encoded form: a naive substring
+        # check on the raw password misses it.
+        import urllib.parse
+
+        mock_api.get(f"{API}/message/m1").mock(
+            return_value=httpx.Response(404, json={"status": 404, "message": "nope"})
+        )
+        with pytest.raises(BlueBubblesError) as excinfo:
+            await client.get_message("m1")
+        rendered = urllib.parse.unquote(str(excinfo.value))
+        assert PASSWORD not in rendered
+        assert urllib.parse.quote(PASSWORD, safe="") not in str(excinfo.value)
+
+    async def test_reports_the_servers_own_explanation(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        mock_api.get(f"{API}/message/m1").mock(
+            return_value=httpx.Response(
+                404,
+                json={
+                    "status": 404,
+                    "message": "The requested resource was not found",
+                    "error": {
+                        "type": "Database Error",
+                        "message": "Message does not exist!",
+                    },
+                },
+            )
+        )
+        with pytest.raises(BlueBubblesError, match="Message does not exist!"):
+            await client.get_message("m1")
+
+    async def test_raises_bluebubbles_error_not_httpx(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        # A raw httpx.HTTPStatusError forces every caller to know about httpx.
+        mock_api.post(f"{API}/message/query").mock(
+            return_value=httpx.Response(500, json={"status": 500, "message": "boom"})
+        )
+        with pytest.raises(BlueBubblesError):
+            await client.search_messages()
+
+    async def test_retains_the_response_body(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        payload = {"status": 400, "message": "bad", "error": {"message": "detail here"}}
+        mock_api.post(f"{API}/message/query").mock(
+            return_value=httpx.Response(400, json=payload)
+        )
+        with pytest.raises(BlueBubblesError) as excinfo:
+            await client.search_messages()
+        assert excinfo.value.response_body == payload
+
+    async def test_includes_the_path_but_not_the_query_string(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        mock_api.get(f"{API}/message/m1").mock(
+            return_value=httpx.Response(404, json={"status": 404})
+        )
+        with pytest.raises(BlueBubblesError) as excinfo:
+            await client.get_message("m1")
+        assert "/api/v1/message/m1" in str(excinfo.value)
+        assert "password" not in str(excinfo.value)
+
+    async def test_non_json_error_body_still_raises_cleanly(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        # An HTML error page from a proxy must not become a JSON parse crash.
+        mock_api.get(f"{API}/message/m1").mock(
+            return_value=httpx.Response(502, text="<html>Bad Gateway</html>")
+        )
+        with pytest.raises(BlueBubblesError, match="502"):
+            await client.get_message("m1")
+
+    async def test_download_attachment_errors_are_wrapped_too(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        # This one returns bytes, so it bypasses the JSON path entirely.
+        mock_api.get(f"{API}/attachment/a1/download").mock(
+            return_value=httpx.Response(404, json={"status": 404, "message": "gone"})
+        )
+        with pytest.raises(BlueBubblesError):
+            await client.download_attachment("a1")
+
+
+# ===========================================================================
 # Contacts
 # ===========================================================================
 
@@ -824,7 +926,7 @@ class TestAttachments:
         mock_api.get(f"{API}/attachment/att1/download").mock(
             return_value=httpx.Response(404)
         )
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(BlueBubblesError):
             await client.download_attachment("att1")
 
     async def test_send_attachment(

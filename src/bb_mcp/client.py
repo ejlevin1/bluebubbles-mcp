@@ -90,13 +90,47 @@ class BlueBubblesClient:
             params.update(extra)
         return params
 
+    def _handle(self, resp: httpx.Response) -> Any:
+        """Turn a response into its ``data``, or raise :class:`BlueBubblesError`.
+
+        Deliberately not ``resp.raise_for_status()``. That builds its message from the
+        full request URL, and this API authenticates with a ``password`` query
+        parameter — so the server credential ends up inside the exception text, which
+        MCP surfaces to the model and writes to logs. It also throws away the server's
+        actual explanation, leaving a bare status code.
+        """
+        body: Any
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+
+        if resp.status_code >= 400:
+            raise BlueBubblesError(
+                self._error_message(resp, body),
+                body if isinstance(body, dict) else None,
+            )
+        if isinstance(body, dict) and body.get("status") and body["status"] >= 400:
+            raise BlueBubblesError(body.get("message", "Unknown error"), body)
+        return body.get("data") if isinstance(body, dict) else None
+
+    @staticmethod
+    def _error_message(resp: httpx.Response, body: Any) -> str:
+        """Describe a failure using the server's own words, and no credentials."""
+        detail = ""
+        if isinstance(body, dict):
+            error = body.get("error")
+            if isinstance(error, dict):
+                detail = error.get("message") or ""
+            detail = detail or body.get("message") or ""
+        # `resp.request.url` carries the password; the path alone does not.
+        path = resp.request.url.path if resp.request is not None else "?"
+        message = f"BlueBubbles API returned {resp.status_code} for {path}"
+        return f"{message}: {detail}" if detail else message
+
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         resp = await self._http.get(self._url(path), params=self._auth_params(params))
-        resp.raise_for_status()
-        body = resp.json()
-        if body.get("status") and body["status"] >= 400:
-            raise BlueBubblesError(body.get("message", "Unknown error"), body)
-        return body.get("data")
+        return self._handle(resp)
 
     async def _post(
         self,
@@ -107,21 +141,13 @@ class BlueBubblesClient:
         resp = await self._http.post(
             self._url(path), json=json, params=self._auth_params(params)
         )
-        resp.raise_for_status()
-        body = resp.json()
-        if body.get("status") and body["status"] >= 400:
-            raise BlueBubblesError(body.get("message", "Unknown error"), body)
-        return body.get("data")
+        return self._handle(resp)
 
     async def _delete(self, path: str, params: dict[str, Any] | None = None) -> Any:
         resp = await self._http.delete(
             self._url(path), params=self._auth_params(params)
         )
-        resp.raise_for_status()
-        body = resp.json()
-        if body.get("status") and body["status"] >= 400:
-            raise BlueBubblesError(body.get("message", "Unknown error"), body)
-        return body.get("data")
+        return self._handle(resp)
 
     async def _put(
         self,
@@ -132,11 +158,7 @@ class BlueBubblesClient:
         resp = await self._http.put(
             self._url(path), json=json, params=self._auth_params(params)
         )
-        resp.raise_for_status()
-        body = resp.json()
-        if body.get("status") and body["status"] >= 400:
-            raise BlueBubblesError(body.get("message", "Unknown error"), body)
-        return body.get("data")
+        return self._handle(resp)
 
     # -- server ---------------------------------------------------------------
 
@@ -533,7 +555,15 @@ class BlueBubblesClient:
             self._url(f"/attachment/{attachment_guid}/download"),
             params=self._auth_params({"original": "true"}),
         )
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = None
+            raise BlueBubblesError(
+                self._error_message(resp, body),
+                body if isinstance(body, dict) else None,
+            )
         return resp.content
 
     async def send_attachment(
@@ -555,11 +585,7 @@ class BlueBubblesClient:
             },
             files={"attachment": (filename, file_data, mime_type)},
         )
-        resp.raise_for_status()
-        body = resp.json()
-        if body.get("status") and body["status"] >= 400:
-            raise BlueBubblesError(body.get("message", "Unknown error"), body)
-        return body.get("data")
+        return self._handle(resp)
 
     # -- scheduled messages ---------------------------------------------------
 
