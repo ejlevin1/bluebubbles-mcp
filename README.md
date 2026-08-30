@@ -188,6 +188,42 @@ explicitly regardless of environment:
 uv run pytest tests/integration -m "not write"
 ```
 
+### Releases and version pinning
+
+Merges to `main` are versioned automatically. `python-semantic-release` reads the
+[Conventional Commits](https://www.conventionalcommits.org/) since the last tag,
+bumps `version` in `pyproject.toml`, tags `vX.Y.Z`, and cuts a GitHub Release.
+
+| Commit type | Bump |
+|---|---|
+| `fix:` / `perf:` | patch — `0.5.0` → `0.5.1` |
+| `feat:` | minor — `0.5.0` → `0.6.0` |
+| `feat!:` or `BREAKING CHANGE:` | major — `0.5.0` → `1.0.0` |
+| `docs:` / `chore:` / `test:` / `refactor:` / `ci:` | no release |
+
+**Pin to a tag.** A branch ref is a moving target, and uv caches the built wheel —
+so `git+https://github.com/ejlevin1/bluebubbles-mcp` (or `@main`) can serve a
+stale build long after main has moved, and needs `--refresh` to update. A version
+tag is immutable, so caching is correct rather than a hazard:
+
+```json
+{
+  "mcpServers": {
+    "bluebubbles": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/ejlevin1/bluebubbles-mcp@v0.5.0", "bb-mcp"],
+      "env": {
+        "BLUEBUBBLES_URL": "https://your-bluebubbles-server",
+        "BLUEBUBBLES_PASSWORD": "your-server-password"
+      }
+    }
+  }
+}
+```
+
+Release tags also build versioned Docker images: `ghcr.io/ejlevin1/bluebubbles-mcp:0.5.0`
+and `:0.5`, alongside the existing `:latest` and `:<sha>`.
+
 ### Validating a branch over uvx
 
 `just smoke-uvx` installs the server straight from git the way an MCP client

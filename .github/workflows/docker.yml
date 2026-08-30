@@ -3,6 +3,9 @@ name: Docker
 on:
   push:
     branches: [main]
+    # Release tags come from python-semantic-release; this is what produces the
+    # versioned images (the branch push only ever yields <sha> and latest).
+    tags: ["v*"]
 
 jobs:
   build-and-push:
@@ -28,6 +31,8 @@ jobs:
           tags: |
             type=sha,prefix=
             type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
 
       - uses: docker/build-push-action@v6
         with:

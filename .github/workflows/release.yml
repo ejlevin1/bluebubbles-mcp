@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  # Two releases racing would both compute the same next version and one would
+  # fail to push its tag. Serialize them instead.
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # Belt and braces: the release commit carries [skip ci], but a repo setting
+    # can disable skip-ci parsing, and a re-run of this job on its own commit
+    # would be a loop.
+    if: "!startsWith(github.event.head_commit.message, 'chore(release):')"
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # semantic-release needs the whole history to find the previous tag
+          # and every commit since it.
+          fetch-depth: 0
+          ref: main
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - name: Release
+        id: release
+        uses: python-semantic-release/python-semantic-release@v10.6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Report
+        run: |
+          if [ "${{ steps.release.outputs.released }}" = "true" ]; then
+            echo "Released ${{ steps.release.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo '```bash' >> "$GITHUB_STEP_SUMMARY"
+            echo "uvx --from 'git+https://github.com/${{ github.repository }}@${{ steps.release.outputs.tag }}' bb-mcp" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No release: no feat/fix/perf commits since the last tag." >> "$GITHUB_STEP_SUMMARY"
+          fi
