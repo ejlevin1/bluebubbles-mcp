@@ -40,6 +40,7 @@ jobs:
           OUT=$(uvx --from 'python-semantic-release==10.6.2' \
                   semantic-release --noop version --print 2>&1 | tail -1 || true)
           echo "result=$OUT" >> "$GITHUB_OUTPUT"
+          echo "tag=$(git describe --tags --abbrev=0 2>/dev/null || echo none)" >> "$GITHUB_OUTPUT"
           # Also to stdout: step summaries are not visible in `gh run view --log`.
           echo "LATEST TAG:    $(git describe --tags --abbrev=0 2>/dev/null || echo none)"
           echo "NEXT VERSION:  $OUT"
@@ -57,10 +58,11 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Warn if no baseline tag
-        if: steps.next.outputs.result == '1.0.0'
+        if: steps.next.outputs.tag == 'none'
         run: |
-          echo "::warning::No baseline tag found — semantic-release scanned all"\
-               "history and computed 1.0.0. Create v0.5.0 before merging."
+          echo "::warning::No tag exists, so semantic-release treats this as a"\
+               "first release and computes 0.1.0 — which would DOWNGRADE the"\
+               "version in pyproject.toml. Create a baseline tag before merging."
 
   release:
     # Push-only, and never on the release commit itself: it carries [skip ci],

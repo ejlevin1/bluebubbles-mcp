@@ -38,7 +38,9 @@ tag_format = "v{version}"
 commit_message = "chore(release): {version} [skip ci]"
 # [skip ci] above stops the release commit from re-triggering CI and Docker on
 # main; the tag push is what drives the versioned image build.
-build_command = "uv build"
+# No build_command: the action runs in its own container where the runner's uv
+# is not on PATH (exit 127), and this project ships via git+uvx and ghcr, not
+# PyPI — so there is no distribution for the release job to build.
 major_on_zero = true
 allow_zero_version = true
 
