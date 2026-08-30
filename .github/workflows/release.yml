@@ -74,6 +74,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      released: ${{ steps.release.outputs.released }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -103,3 +107,51 @@ jobs:
           else
             echo "No release: no feat/fix/perf commits since the last tag." >> "$GITHUB_STEP_SUMMARY"
           fi
+
+  # The versioned image must be built AFTER the tag exists, from the tagged
+  # commit. Chaining it here rather than relying on docker.yml's `tags: v*`
+  # trigger is deliberate: GitHub does not start workflows from events created
+  # with GITHUB_TOKEN, so the tag semantic-release pushes never fires that
+  # trigger. (A hand-pushed tag does — which is why v0.5.0 got an image and
+  # v0.5.1 did not.)
+  docker:
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The tag, not main: main has moved on by the release commit, and the
+          # image must match what the tag points at.
+          ref: ${{ needs.release.outputs.tag }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # `value:` supplies the version explicitly — the triggering event is a
+          # push to main, so metadata-action cannot infer it from the ref.
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.release.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release.outputs.tag }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
