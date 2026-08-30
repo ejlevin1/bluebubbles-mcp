@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  # Two releases racing would both compute the same next version and one would
+  # fail to push its tag. Serialize them instead.
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # Runs on every PR: reports the version this PR would produce once merged,
+  # without tagging anything. Also the only way to exercise the release config
+  # before it reaches main — workflow_dispatch is unavailable off the default
+  # branch.
+  dry-run:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - name: Compute next version
+        id: next
+        run: |
+          # semantic-release only acts on a branch in a release group, so stand
+          # the merge result up as 'main' locally. Nothing is pushed.
+          git checkout -B main
+          OUT=$(uvx --from 'python-semantic-release==10.6.2' \
+                  semantic-release --noop version --print 2>&1 | tail -1 || true)
+          echo "result=$OUT" >> "$GITHUB_OUTPUT"
+          # Also to stdout: step summaries are not visible in `gh run view --log`.
+          echo "LATEST TAG:    $(git describe --tags --abbrev=0 2>/dev/null || echo none)"
+          echo "NEXT VERSION:  $OUT"
+          {
+            echo "### Release preview"
+            echo ""
+            echo "Latest tag: \`$(git describe --tags --abbrev=0 2>/dev/null || echo 'none')\`"
+            echo ""
+            echo "On merge to main this produces: \`$OUT\`"
+            echo ""
+            echo "Commits considered:"
+            echo '```'
+            git log --oneline "$(git describe --tags --abbrev=0 2>/dev/null || echo HEAD~5)"..HEAD 2>/dev/null | head -20
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Warn if no baseline tag
+        if: steps.next.outputs.result == '1.0.0'
+        run: |
+          echo "::warning::No baseline tag found — semantic-release scanned all"\
+               "history and computed 1.0.0. Create v0.5.0 before merging."
+
+  release:
+    # Push-only, and never on the release commit itself: it carries [skip ci],
+    # but a repo setting can disable skip-ci parsing and a re-run of this job on
+    # its own commit would loop.
+    if: >-
+      github.event_name == 'push' &&
+      !startsWith(github.event.head_commit.message, 'chore(release):')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # semantic-release needs the whole history to find the previous tag
+          # and every commit since it.
+          fetch-depth: 0
+          ref: main
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - name: Release
+        id: release
+        uses: python-semantic-release/python-semantic-release@v10.6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Report
+        run: |
+          if [ "${{ steps.release.outputs.released }}" = "true" ]; then
+            echo "Released ${{ steps.release.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo '```bash' >> "$GITHUB_STEP_SUMMARY"
+            echo "uvx --from 'git+https://github.com/${{ github.repository }}@${{ steps.release.outputs.tag }}' bb-mcp" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No release: no feat/fix/perf commits since the last tag." >> "$GITHUB_STEP_SUMMARY"
+          fi
