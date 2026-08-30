@@ -1041,3 +1041,73 @@ class TestPrivateApiDisabled:
             raise_on_error=False,
         )
         assert result.is_error
+
+
+# ---------------------------------------------------------------------------
+# Bundled skill resources
+# ---------------------------------------------------------------------------
+
+
+class TestSkillResources:
+    async def test_skill_dir_ships_with_the_package(self) -> None:
+        from bb_mcp.server import SKILL_DIR
+
+        assert (SKILL_DIR / "SKILL.md").is_file()
+        assert (SKILL_DIR / "references" / "best-practices.md").is_file()
+        assert (SKILL_DIR / "references" / "tools.md").is_file()
+
+    async def test_lists_main_file_and_manifest(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        client, _ = mcp_client
+        uris = {str(r.uri) for r in await client.list_resources()}
+        assert "skill://bluebubbles/SKILL.md" in uris
+        assert "skill://bluebubbles/_manifest" in uris
+
+    async def test_supporting_files_exposed_via_template(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        client, _ = mcp_client
+        templates = {t.uriTemplate for t in await client.list_resource_templates()}
+        assert "skill://bluebubbles/{path*}" in templates
+        # "template" mode: reference files are not listed individually.
+        uris = {str(r.uri) for r in await client.list_resources()}
+        assert not any(u.startswith("skill://bluebubbles/references/") for u in uris)
+
+    async def test_reads_skill_md(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        client, _ = mcp_client
+        contents = await client.read_resource("skill://bluebubbles/SKILL.md")
+        text = contents[0].text  # type: ignore[union-attr]
+        assert text.startswith("---")
+        assert "name: bluebubbles" in text
+
+    async def test_manifest_lists_every_file(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        import json
+
+        client, _ = mcp_client
+        contents = await client.read_resource("skill://bluebubbles/_manifest")
+        manifest = json.loads(contents[0].text)  # type: ignore[union-attr]
+        assert manifest["skill"] == "bluebubbles"
+        assert {f["path"] for f in manifest["files"]} == {
+            "SKILL.md",
+            "references/best-practices.md",
+            "references/tools.md",
+        }
+
+    async def test_reads_supporting_file_through_template(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        client, _ = mcp_client
+        contents = await client.read_resource("skill://bluebubbles/references/tools.md")
+        assert contents[0].text.strip()  # type: ignore[union-attr]
+
+    async def test_escaping_the_skill_dir_is_rejected(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        client, _ = mcp_client
+        with pytest.raises(Exception):
+            await client.read_resource("skill://bluebubbles/../../server.py")

@@ -148,6 +148,24 @@ can actually run.
 | `delete_chat` | Delete a conversation | destructive, open-world |
 | `delete_scheduled_message` | Cancel scheduled message | destructive, open-world |
 
+## Skill
+
+The server bundles an agent skill — the messaging workflows, contact-resolution rules,
+E.164 normalization, and destructive-action confirmations an agent needs to use these
+tools well — and publishes it over MCP as `skill://` resources. It ships inside the
+package (`src/bb_mcp/skills/bluebubbles/`), so uvx, Docker, and source installs all serve
+it; there is nothing to copy into `~/.claude/skills/`.
+
+| Resource | Contents |
+|----------|----------|
+| `skill://bluebubbles/SKILL.md` | The skill itself: rules, contact resolution, workflows |
+| `skill://bluebubbles/_manifest` | JSON listing every skill file with size and SHA-256 |
+| `skill://bluebubbles/{path*}` | Template for supporting files, e.g. `skill://bluebubbles/references/tools.md` |
+
+Supporting files are reached through the template rather than listed individually — read
+the manifest to discover them. Clients that don't support MCP resources simply ignore
+these; the tools work the same either way.
+
 ## Testing
 
 ```bash
