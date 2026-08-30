@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.5.2 (2026-08-30)
+
+### Bug Fixes
+
+- **ci**: Build the versioned image after the tag exists
+  ([`f8c74ed`](https://github.com/ejlevin1/bluebubbles-mcp/commit/f8c74ed9bc5fbae3ce3e0f41b63b364eedd97d7f))
+
+
 ## v0.5.1 (2026-08-30)
 
 ### Bug Fixes
