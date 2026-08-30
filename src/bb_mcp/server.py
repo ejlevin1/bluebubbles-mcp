@@ -7,10 +7,12 @@ import base64
 import os
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import typer
 from fastmcp import Context, FastMCP
+from fastmcp.server.providers.skills import SkillProvider
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.types import Image
 from mcp.types import ToolAnnotations
@@ -144,11 +146,26 @@ mcp = FastMCP(
         "All sends, reactions, and read receipts are real and visible to the other person. "
         "Always confirm with the user before destructive actions (delete chat, unsend message, "
         "remove participant).\n\n"
-        "If a 'bluebubbles' skill is available, load it now for workflows, the full tool "
-        "catalog, and best practices before proceeding."
+        "This server publishes its own usage skill as an MCP resource. Read "
+        "skill://bluebubbles/SKILL.md for workflows, the full tool catalog, and best "
+        "practices before proceeding; skill://bluebubbles/_manifest lists its supporting "
+        "reference files."
     ),
     lifespan=lifespan,
 )
+
+
+# ---------------------------------------------------------------------------
+# Bundled skill
+# ---------------------------------------------------------------------------
+
+#: Ships inside the package so it travels with every install (uvx, wheel, Docker).
+SKILL_DIR = Path(__file__).parent / "skills" / "bluebubbles"
+
+try:
+    mcp.add_provider(SkillProvider(SKILL_DIR))
+except FileNotFoundError:  # pragma: no cover - broken/partial install
+    logger.warning("Bundled bluebubbles skill not found at %s; skipping.", SKILL_DIR)
 
 
 def _bb(ctx: Context) -> BlueBubblesClient:
@@ -1082,7 +1099,10 @@ def main(
 ) -> None:
     mcp.mask_error_details = mask_errors  # type: ignore[attr-defined]
     mcp._my_address_override = my_address  # type: ignore[attr-defined]
-    mcp.run(transport="stdio")
+    # No banner: it is an ASCII art box plus a PyPI update nag written to
+    # stderr, which is noise in an MCP client's logs. Suppressing it also
+    # skips the version-check HTTP call on every startup.
+    mcp.run(transport="stdio", show_banner=False)
 
 
 if __name__ == "__main__":

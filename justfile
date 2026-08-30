@@ -25,9 +25,10 @@ test-integration *args:
 coverage:
     uv run --extra dev pytest tests/ --ignore=tests/integration -v --cov=src/bb_mcp --cov-report=term-missing
 
-# Run smoke test against uvx config (requires BLUEBUBBLES_URL and BLUEBUBBLES_PASSWORD)
-smoke-uvx:
-    uv run scripts/smoke_uvx.py
+# Run smoke test against uvx config: installs from git and validates tools + skill
+# Usage: just smoke-uvx [--ref my-branch] [--source git+file://$PWD]
+smoke-uvx *args:
+    uv run scripts/smoke_uvx.py {{ args }}
 
 # Run smoke test against Docker config (requires BLUEBUBBLES_URL and BLUEBUBBLES_PASSWORD)
 smoke-docker:
