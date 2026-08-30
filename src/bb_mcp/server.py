@@ -1099,7 +1099,10 @@ def main(
 ) -> None:
     mcp.mask_error_details = mask_errors  # type: ignore[attr-defined]
     mcp._my_address_override = my_address  # type: ignore[attr-defined]
-    mcp.run(transport="stdio")
+    # No banner: it is an ASCII art box plus a PyPI update nag written to
+    # stderr, which is noise in an MCP client's logs. Suppressing it also
+    # skips the version-check HTTP call on every startup.
+    mcp.run(transport="stdio", show_banner=False)
 
 
 if __name__ == "__main__":

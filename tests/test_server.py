@@ -1163,3 +1163,34 @@ class TestSkillResources:
         client, _ = mcp_client
         with pytest.raises(Exception):
             await client.read_resource("skill://bluebubbles/../../server.py")
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+
+class TestCli:
+    def _run(self, monkeypatch: pytest.MonkeyPatch, *args: str) -> dict[str, Any]:
+        """Invoke the CLI with mcp.run stubbed; return the kwargs it was called with."""
+        from typer.testing import CliRunner
+
+        from bb_mcp import server
+
+        captured: dict[str, Any] = {}
+
+        def fake_run(**kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        monkeypatch.setattr(server.mcp, "run", fake_run)
+        result = CliRunner().invoke(server.app, list(args))
+        assert result.exit_code == 0, result.output
+        return captured
+
+    def test_banner_is_suppressed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The banner is an ASCII box + PyPI update nag on stderr — noise for a
+        stdio client, and it costs an HTTP call on every startup."""
+        assert self._run(monkeypatch)["show_banner"] is False
+
+    def test_runs_over_stdio(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert self._run(monkeypatch)["transport"] == "stdio"
