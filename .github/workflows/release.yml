@@ -40,6 +40,9 @@ jobs:
           OUT=$(uvx --from 'python-semantic-release==10.6.2' \
                   semantic-release --noop version --print 2>&1 | tail -1 || true)
           echo "result=$OUT" >> "$GITHUB_OUTPUT"
+          # Also to stdout: step summaries are not visible in `gh run view --log`.
+          echo "LATEST TAG:    $(git describe --tags --abbrev=0 2>/dev/null || echo none)"
+          echo "NEXT VERSION:  $OUT"
           {
             echo "### Release preview"
             echo ""
