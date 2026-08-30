@@ -1049,6 +1049,9 @@ class TestPrivateApiDisabled:
 
 
 class TestSkillResources:
+    #: Every skill doc is comfortably over 3KB; a stub would fall well under.
+    MIN_SKILL_FILE_BYTES = 1_000
+
     async def test_skill_dir_ships_with_the_package(self) -> None:
         from bb_mcp.server import SKILL_DIR
 
@@ -1098,12 +1101,61 @@ class TestSkillResources:
             "references/tools.md",
         }
 
-    async def test_reads_supporting_file_through_template(
+    async def test_every_file_served_byte_identical_to_disk(
         self, mcp_client: tuple[Client, respx.Router]
     ) -> None:
+        """Each advertised file must arrive intact.
+
+        Asserting merely "non-empty" would still pass on a truncated or stale
+        file shipped by a future packaging change, so compare the served bytes
+        against both the manifest's own hash and the file on disk.
+        """
+        import hashlib
+        import json
+
+        from bb_mcp.server import SKILL_DIR
+
         client, _ = mcp_client
-        contents = await client.read_resource("skill://bluebubbles/references/tools.md")
-        assert contents[0].text.strip()  # type: ignore[union-attr]
+        manifest = json.loads(
+            (await client.read_resource("skill://bluebubbles/_manifest"))[0].text  # type: ignore[union-attr]
+        )
+        assert manifest["files"], "manifest advertised no files"
+
+        for entry in manifest["files"]:
+            path = entry["path"]
+            contents = await client.read_resource(f"skill://bluebubbles/{path}")
+            served = contents[0].text.encode("utf-8")  # type: ignore[union-attr]
+            digest = "sha256:" + hashlib.sha256(served).hexdigest()
+
+            assert digest == entry["hash"], f"{path}: served bytes != manifest hash"
+            assert len(served) == entry["size"], f"{path}: served size != manifest size"
+            assert served == (SKILL_DIR / path).read_bytes(), (
+                f"{path}: served bytes != file on disk"
+            )
+            # The manifest is generated from the files on disk, so hashes alone
+            # are self-consistent even for a truncated file. A size floor is what
+            # actually catches a packaging change that ships a stub.
+            assert len(served) > self.MIN_SKILL_FILE_BYTES, (
+                f"{path}: only {len(served)} bytes — looks truncated"
+            )
+
+    async def test_supporting_files_carry_real_content(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        """Hashes prove integrity; these prove we shipped the right documents."""
+        client, _ = mcp_client
+
+        tools = (await client.read_resource("skill://bluebubbles/references/tools.md"))[
+            0
+        ].text  # type: ignore[union-attr]
+        assert "Private API" in tools
+
+        practices = (
+            await client.read_resource(
+                "skill://bluebubbles/references/best-practices.md"
+            )
+        )[0].text  # type: ignore[union-attr]
+        assert practices.lstrip().startswith("#")
 
     async def test_escaping_the_skill_dir_is_rejected(
         self, mcp_client: tuple[Client, respx.Router]

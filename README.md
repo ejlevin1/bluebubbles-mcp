@@ -188,6 +188,21 @@ explicitly regardless of environment:
 uv run pytest tests/integration -m "not write"
 ```
 
+### Validating a branch over uvx
+
+`just smoke-uvx` installs the server straight from git the way an MCP client
+would, then validates tools and the bundled skill over stdio — including
+fetching every skill file and checking its size and SHA-256 against the manifest.
+
+```bash
+just smoke-uvx                                   # default repo, default branch
+just smoke-uvx --ref my-branch                   # a branch, tag, or commit SHA
+just smoke-uvx --source "git+file://$PWD" --ref my-branch   # local repo, no push needed
+just smoke-uvx --from 'git+https://github.com/you/fork@sha'
+```
+
+Requires `BLUEBUBBLES_URL` and `BLUEBUBBLES_PASSWORD` (`just` loads `.env`).
+
 ## Polling for new messages
 
 `get_recent_messages` returns a cursor. Pass it back as `since` on the next call and you
