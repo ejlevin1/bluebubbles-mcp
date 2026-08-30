@@ -5,6 +5,9 @@ on:
     branches: [main]
     # Release tags come from python-semantic-release; this is what produces the
     # versioned images (the branch push only ever yields <sha> and latest).
+    # Covers hand-pushed tags. Tags created by semantic-release do NOT reach
+    # here — GitHub suppresses workflow triggers for GITHUB_TOKEN-created
+    # events — so release.yml builds the versioned image itself.
     tags: ["v*"]
 
 jobs:
