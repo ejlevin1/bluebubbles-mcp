@@ -123,26 +123,27 @@ can actually run.
 | `get_message` | Single message by GUID | read-only |
 | `get_contacts` | All contacts | read-only |
 | `lookup_contact` | Look up by phone/email | read-only |
-| `check_imessage` | Check iMessage registration | read-only |
-| `check_facetime` | Check FaceTime registration | read-only |
+| `get_my_address` | Your own iMessage identity, for filtering your messages out of a thread | read-only |
+| `check_imessage` | Check iMessage registration | read-only, **Private API** |
+| `check_facetime` | Check FaceTime registration | read-only, **Private API** |
 | `list_scheduled_messages` | List future messages | read-only |
-| `get_recent_messages` | New + changed messages since a cursor (incremental polling) | read-only |
+| `get_recent_messages` | New + changed messages since a cursor (incremental polling); optional `chat_guid` to scope to one chat | read-only |
 | `get_unread_chats` | Chats with unread messages + their latest messages | read-only |
 | `get_attachment_info` | Attachment metadata | read-only |
 | `download_attachment` | Download attachment as base64 | read-only |
 | `mark_chat_read` | Send read receipt | idempotent, open-world, **Private API** |
 | `mark_chat_unread` | Mark chat unread | idempotent, **Private API** |
 | `rename_group` | Rename a group chat | idempotent |
-| `start_typing` | Show typing indicator | open-world |
-| `stop_typing` | Stop typing indicator | open-world |
+| `start_typing` | Show typing indicator | open-world, **Private API** |
+| `stop_typing` | Stop typing indicator | open-world, **Private API** |
 | `send_message` | Send to existing chat | open-world |
 | `send_message_to_address` | Send to phone/email | open-world |
-| `send_attachment` | Send a file attachment | open-world |
-| `send_reaction` | Tapback reaction | open-world |
-| `edit_message` | Edit a sent message | open-world |
+| `send_attachment` | Send a file attachment | open-world, **Private API** |
+| `send_reaction` | Tapback reaction | open-world, **Private API** |
+| `edit_message` | Edit a sent message | open-world, **Private API** |
 | `schedule_message` | Schedule a future message | open-world |
 | `add_participant` | Add to group chat | open-world |
-| `unsend_message` | Retract a message | destructive, open-world |
+| `unsend_message` | Retract a message | destructive, open-world, **Private API** |
 | `remove_participant` | Remove from group chat | destructive, open-world |
 | `leave_chat` | Leave a group chat | destructive, open-world |
 | `delete_chat` | Delete a conversation | destructive, open-world |
@@ -259,12 +260,22 @@ while True:
     result = get_recent_messages(since=result["cursor"])
 ```
 
-Two rules matter:
+Pass `chat_guid` to follow a single conversation. A scoped poll returns only that
+chat's deltas, and is the right way to watch one thread — `get_chat_messages` cannot
+show you an edit or an unsend.
+
+Three rules matter:
 
 - **`has_more: true` means poll again immediately.** There is a backlog and you are
   holding a partial page; waiting for the next interval just delays it.
 - **Pass the cursor back verbatim.** It encodes two independent watermarks, and a
   malformed value is rejected rather than silently reinterpreted.
+- **A cursor belongs to the scope that minted it.** Replaying a scoped cursor on a
+  global poll, or the reverse, is rejected rather than silently skipping messages. Seed
+  a new scope with `minutes` instead of reusing the other scope's cursor.
+
+A scoped poll cannot surface messages that belong to no chat, such as some SMS
+shortcodes and 2FA senders. Poll globally for those.
 
 Do not poll by calling with `minutes` repeatedly — that re-reads the same messages every
 time and can never show you an edit or an unsend, because `after` filters only on when a

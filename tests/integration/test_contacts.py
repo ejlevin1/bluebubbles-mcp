@@ -19,9 +19,10 @@ async def test_check_imessage_availability(
 ) -> None:
     if not private_api:
         pytest.skip("handle availability requires the Private API")
-    # Use Apple's own test address — won't cause any side effects
+    # A registration lookup — reaches Apple, but sends nothing to the address.
     result = await client.check_imessage_availability("apple@apple.com")
-    assert isinstance(result, bool)
+    assert isinstance(result, dict)
+    assert isinstance(result["available"], bool)
 
 
 async def test_check_facetime_availability(
@@ -30,4 +31,24 @@ async def test_check_facetime_availability(
     if not private_api:
         pytest.skip("handle availability requires the Private API")
     result = await client.check_facetime_availability("apple@apple.com")
-    assert isinstance(result, bool)
+    assert isinstance(result, dict)
+    assert isinstance(result["available"], bool)
+
+
+async def test_check_imessage_availability_detects_registered_address(
+    client: BlueBubblesClient, private_api: bool
+) -> None:
+    """A False for every input would satisfy the shape check above.
+
+    Pin the positive case to the server's own iMessage address, which is
+    registered by definition — otherwise a lookup that silently answered
+    "unavailable" for everything would still pass.
+    """
+    if not private_api:
+        pytest.skip("handle availability requires the Private API")
+    info = await client.server_info()
+    me = info.get("detected_imessage") or info.get("detected_icloud")
+    if not me:
+        pytest.skip("Server did not report a detected iMessage address")
+    result = await client.check_imessage_availability(me)
+    assert result["available"] is True

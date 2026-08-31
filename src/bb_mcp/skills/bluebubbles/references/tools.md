@@ -25,10 +25,10 @@ the BlueBubbles Private API which is not enabled on their server.
 | Tool | Purpose |
 |------|---------|
 | `get_unread_chats` | Unread conversations with recent messages included — start here when checking messages |
-| `get_recent_messages` | All messages across all chats within last N minutes |
+| `get_recent_messages` | Cursor-based poll for what is NEW or CHANGED (edits, unsends) — the only tool that returns deltas. Add `chat_guid` to scope the poll to one conversation; omit it to poll every chat. A cursor is bound to the scope it was minted in — see [best-practices.md](best-practices.md#polling-for-new-messages) |
 | `list_chats` | All conversations sorted by recent activity |
 | `get_chat` | Details and participants for a specific chat |
-| `get_chat_messages` | Message history for a chat; supports `after`/`before` epoch-ms filtering and `ASC`/`DESC` sort |
+| `get_chat_messages` | Browse or backfill a chat's history. `after`/`before` filter only `message.date` (creation time), so it re-returns already-seen messages and can never surface an edit or unsend — use `get_recent_messages` for that. Supports `ASC`/`DESC` sort |
 | `search_messages` | Full-text search across all iMessage/SMS history; filter by `chat_guid`, `after`, `before` |
 | `get_message` | Single message by GUID including attachments |
 
@@ -37,12 +37,12 @@ the BlueBubbles Private API which is not enabled on their server.
 | Tool | Purpose |
 |------|---------|
 | `send_message` | Send to an existing chat by GUID |
-| `send_message_to_address` | Send to a phone number or email; `service` defaults to `"iMessage"` (`"SMS"` requires Private API) |
+| `send_message_to_address` | Send to a phone number or email. Only `service="SMS"` is honored — under the Private API it routes through `POST /chat/new` and returns a **chat** object (`guid`, `text=None`), not a message. `service="iMessage"` is still ignored; the server always picks the service itself for non-SMS sends |
 | `send_attachment` | ⚠️ Private API — Send a photo, video, or file; `data_base64` is base64-encoded file content |
 | `send_reaction` | ⚠️ Private API — Tapback: `love`, `like`, `dislike`, `laugh`, `emphasize`, `question`; prefix with `-` to remove |
 | `edit_message` | ⚠️ Private API — Edit a sent iMessage (iMessage only, not SMS) |
 | `unsend_message` | ⚠️ Private API — Retract a sent iMessage — irreversible, confirm first |
-| `schedule_message` | Queue for future delivery; `scheduled_for` is epoch milliseconds |
+| `schedule_message` | Queue for future delivery; `scheduled_for` is epoch milliseconds. The send method is frozen when you schedule, not re-checked when it fires — so a scheduled send can fail later even though scheduling succeeded |
 
 ## Contacts
 
@@ -75,7 +75,7 @@ the BlueBubbles Private API which is not enabled on their server.
 
 | Tool | Purpose |
 |------|---------|
-| `list_scheduled_messages` | All pending scheduled messages |
+| `list_scheduled_messages` | All pending scheduled messages. Each record carries `status` (`pending`/`in-progress`/`complete`/`error`) and `error` — the only way to find out a scheduled send failed after the fact. Check it before telling the user a scheduled message went out |
 | `delete_scheduled_message` | Cancel a scheduled message by ID |
 
 ## Attachments
@@ -91,3 +91,4 @@ the BlueBubbles Private API which is not enabled on their server.
 |------|---------|
 | `ping` | Check connectivity |
 | `get_server_info` | Version, OS, configuration |
+| `get_my_address` | The user's own iMessage addresses: `address` (primary), `addresses` (all, primary first), `name`, `source` (`icloud_account`, `server_info`, or `override`). **Never** pass these to `from_address` on search/fetch tools — that filter matches the *other* party in a conversation; pass the literal string `'me'` to find messages the user sent |

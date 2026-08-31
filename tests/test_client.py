@@ -379,11 +379,11 @@ class TestMessages:
     async def test_send_message_with_optionals(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
+        client.private_api = True
         route = mock_api.post(f"{API}/message/text").mock(return_value=ok_json({}))
         await client.send_message(
             "g1",
             "Hi",
-            method="private-api",
             subject="Subj",
             reply_to_guid="reply-guid",
         )
@@ -392,8 +392,22 @@ class TestMessages:
         body = json.loads(route.calls[0].request.content)
         assert body["method"] == "private-api"
         assert body["subject"] == "Subj"
-        # selectedMessageGuid only sent for non-apple-script methods
+        # selectedMessageGuid only threads under the Private API
         assert body["selectedMessageGuid"] == "reply-guid"
+
+    async def test_reply_threads_only_under_the_private_api(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        # AppleScript cannot express a threaded reply, so the field is dropped rather
+        # than sent and silently ignored. The old guard was `method != "apple-script"`
+        # against a parameter nothing ever overrode, so replies never threaded at all.
+        route = mock_api.post(f"{API}/message/text").mock(return_value=ok_json({}))
+        await client.send_message("g1", "Hi", reply_to_guid="reply-guid")
+        import json
+
+        body = json.loads(route.calls[0].request.content)
+        assert body["method"] == "apple-script"
+        assert "selectedMessageGuid" not in body
 
     async def test_send_message_unique_temp_guids(
         self, client: BlueBubblesClient, mock_api: respx.Router
@@ -412,7 +426,8 @@ class TestMessages:
     async def test_send_message_to_address(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
-        # Default method is apple-script: routes through /message/text with any;-;<address> GUID
+        # Without the Private API: /message/text with the canonical any;-;<address>
+        # GUID, which lets the server pick the service for SMS-only recipients.
         route = mock_api.post(f"{API}/message/text").mock(
             return_value=ok_json({"guid": "m1"})
         )
@@ -426,25 +441,78 @@ class TestMessages:
         assert body["method"] == "apple-script"
         assert body["tempGuid"].startswith("temp-")
 
-    async def test_send_message_to_address_private_api(
+    async def test_send_message_to_address_sms_uses_chat_new(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
-        # Private-api method: routes through /chat/new with addresses list
+        # /chat/new is the only route that pins the service, so SMS needs it — and it
+        # returns a CHAT, not a message: guid is a chat GUID and text is None.
+        client.private_api = True
         route = mock_api.post(f"{API}/chat/new").mock(
-            return_value=ok_json({"guid": "new-chat"})
+            return_value=ok_json({"guid": "any;-;+15551234567", "text": None})
         )
         result = await client.send_message_to_address(
-            "+15551234567", "Hey", method="private-api"
+            "+15551234567", "Hey", service="SMS"
         )
-        assert result == {"guid": "new-chat"}
+        assert result == {"guid": "any;-;+15551234567", "text": None}
         import json
 
         body = json.loads(route.calls[0].request.content)
         assert body["addresses"] == ["+15551234567"]
         assert body["message"] == "Hey"
-        assert body["service"] == "iMessage"
+        assert body["service"] == "SMS"
         assert body["method"] == "private-api"
         assert body["tempGuid"].startswith("temp-")
+
+    async def test_send_message_to_address_default_service_stays_on_message_text(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        # Routing everything through /chat/new would return a chat instead of a
+        # message and force service=iMessage on every recipient.
+        client.private_api = True
+        route = mock_api.post(f"{API}/message/text").mock(
+            return_value=ok_json({"guid": "m1"})
+        )
+        result = await client.send_message_to_address("+15551234567", "Hey")
+        assert result == {"guid": "m1"}
+        import json
+
+        body = json.loads(route.calls[0].request.content)
+        assert body["chatGuid"] == "any;-;+15551234567"
+        assert body["method"] == "private-api"
+
+    async def test_send_message_to_address_sms_without_the_private_api(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        # /chat/new requires the Private API, so SMS falls back to /message/text.
+        route = mock_api.post(f"{API}/message/text").mock(
+            return_value=ok_json({"guid": "m1"})
+        )
+        result = await client.send_message_to_address(
+            "+15551234567", "Hey", service="SMS"
+        )
+        assert result == {"guid": "m1"}
+        import json
+
+        body = json.loads(route.calls[0].request.content)
+        assert body["chatGuid"] == "any;-;+15551234567"
+        assert body["method"] == "apple-script"
+
+    @pytest.mark.parametrize("service", ["sms", "SMS/MMS", "iMessages", ""])
+    async def test_send_message_to_address_refuses_a_non_canonical_service(
+        self, client: BlueBubblesClient, mock_api: respx.Router, service: str
+    ) -> None:
+        """This method is public and does not canonicalize, so a library consumer or
+        a script could otherwise reproduce the original bug: an unrecognized service
+        silently going out over iMessage."""
+        client.private_api = True
+        text = mock_api.post(f"{API}/message/text").mock(
+            return_value=ok_json({"guid": "m1"})
+        )
+        new_chat = mock_api.post(f"{API}/chat/new").mock(return_value=ok_json({}))
+        with pytest.raises(ValueError, match="service must be one of"):
+            await client.send_message_to_address("+15551234567", "Hey", service=service)
+        assert not text.called
+        assert not new_chat.called
 
     async def test_send_reaction(
         self, client: BlueBubblesClient, mock_api: respx.Router
@@ -630,6 +698,20 @@ class TestMessages:
         assert list(clause["args"]) == ["changedAfter"]
         assert clause["args"]["changedAfter"] == changed_bind_ns(1_700_000_000_000)
 
+    async def test_query_changed_since_scopes_to_a_chat(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.post(f"{API}/message/query").mock(return_value=ok_json([]))
+        await client.query_changed_since(
+            since_ms=1, limit=5, chat_guid="iMessage;-;+15551234567"
+        )
+        import json
+
+        assert (
+            json.loads(route.calls[0].request.content)["chatGuid"]
+            == "any;-;+15551234567"
+        )
+
     async def test_query_changed_since_floors_the_bind_at_zero(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
@@ -732,6 +814,30 @@ class TestMessages:
             "method": "apple-script",
         }
         assert "chatGuid" not in body, "the flat shape is what the server rejects"
+
+    async def test_create_scheduled_message_follows_the_connection(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        # The method is frozen here rather than resolved when the message fires:
+        # BlueBubbles only auto-resolves an absent method, and its validator rejects a
+        # payload without one, so the choice cannot be deferred to send time.
+        client.private_api = True
+        route = mock_api.post(f"{API}/message/schedule").mock(return_value=ok_json({}))
+        await client.create_scheduled_message("g1", "hi", 1_800_000_000_000)
+        import json
+
+        body = json.loads(route.calls[0].request.content)
+        assert body["payload"]["method"] == "private-api"
+
+    async def test_create_scheduled_message_falls_back_without_the_private_api(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.post(f"{API}/message/schedule").mock(return_value=ok_json({}))
+        await client.create_scheduled_message("g1", "hi", 1_800_000_000_000)
+        import json
+
+        body = json.loads(route.calls[0].request.content)
+        assert body["payload"]["method"] == "apple-script"
 
     async def test_get_message(
         self, client: BlueBubblesClient, mock_api: respx.Router
