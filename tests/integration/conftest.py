@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import pathlib
+from typing import Any
 
 import pytest
 
 from bb_mcp.client import BlueBubblesClient
+from bb_mcp.server import _read_send_method, _send_capable
 
 
 def _load_dotenv() -> None:
@@ -59,9 +62,48 @@ def bb_password() -> str:
     return pw  # type: ignore[return-value]
 
 
+@pytest.fixture(scope="session")
+def server_info(bb_url: str, bb_password: str) -> dict[str, Any]:
+    """One live ``GET /server/info`` for the whole session.
+
+    Probed independently of the `client` fixture: `client` has to know the send
+    capability before it is handed to a test, so it cannot depend on a fixture that
+    itself depends on a client. Session-scoped because this is a real HTTP call and
+    the answer does not change under a test run.
+
+    Synchronous, with its own ``asyncio.run``, so that a session-scoped fixture
+    never has to borrow pytest-asyncio's function-scoped event loop.
+    """
+
+    async def _probe() -> dict[str, Any]:
+        c = BlueBubblesClient(bb_url, bb_password)
+        try:
+            return await c.server_info()
+        finally:
+            await c.close()
+
+    return asyncio.run(_probe())
+
+
+@pytest.fixture(scope="session")
+def send_capable(server_info: dict[str, Any]) -> bool:
+    """Whether sends on this server may go out over the Private API.
+
+    Deliberately `bb_mcp.server`'s own predicate rather than a second copy: it folds
+    in ``helper_connected`` (truthiness, so a Node-serialised ``0`` counts as
+    disconnected) and the ``BLUEBUBBLES_SEND_METHOD`` override, and a copy here
+    would drift from the thing under test.
+    """
+    return _send_capable(server_info, _read_send_method())
+
+
 @pytest.fixture
-async def client(bb_url: str, bb_password: str):  # type: ignore[return]
+async def client(bb_url: str, bb_password: str, send_capable: bool):  # type: ignore[return]
     c = BlueBubblesClient(bb_url, bb_password)
+    # `lifespan` assigns this after probing /server/info; without it every
+    # client-level integration test would silently exercise only the AppleScript
+    # fallback, which is the blind spot the capability check exists to remove.
+    c.private_api = send_capable
     yield c
     await c.close()
 
@@ -74,16 +116,18 @@ async def first_chat_guid(client: BlueBubblesClient) -> str:
     return chats[0]["guid"]
 
 
-@pytest.fixture
-async def private_api(client: BlueBubblesClient) -> bool:
+@pytest.fixture(scope="session")
+def private_api(server_info: dict[str, Any]) -> bool:
     """Whether the server has the Private API enabled.
 
     Several routes (handle availability, reactions, edits) 500 outright without it,
     so tests that need them should skip rather than fail on a server that simply is
     not configured for them.
+
+    This is the raw toggle, matching `lifespan`'s use of it for the Private-API
+    *routes*. Sends are a different question — see `send_capable`.
     """
-    info = await client.server_info()
-    return bool(info.get("private_api"))
+    return bool(server_info.get("private_api"))
 
 
 @pytest.fixture

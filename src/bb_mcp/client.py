@@ -12,6 +12,11 @@ import httpx
 from bb_mcp.cursor import changed_bind_ns, exclusive_apple_ns
 
 
+#: The only services :meth:`BlueBubblesClient.send_message_to_address` accepts. The
+#: value goes on the wire and picks the transport, so a near-miss is refused rather
+#: than normalized — see the tool layer, which canonicalizes exactly once.
+_SERVICES: Final = frozenset({"SMS", "iMessage"})
+
 #: GUID batch size for :meth:`BlueBubblesClient.resolve_message_chats`. Well under
 #: SQLite's 999-variable ceiling once the ``IN (:...guids)`` spread expands.
 _GUID_CHUNK: Final = 400
@@ -46,10 +51,13 @@ def _like_clause(query: str) -> dict[str, Any]:
 def _sender_clauses(handle_address: str | None, from_me: bool) -> list[dict[str, Any]]:
     """Build the sender filter.
 
-    ``handle`` carries the *other* party, never the account owner, so
-    ``handle.id = <my own address>`` matches nothing at all — verified live: 0 rows
-    against 85 outgoing messages in the same window. Filtering to the user's own
-    messages has to go through ``message.is_from_me``.
+    ``handle`` names the party on the *other* end of the conversation, so it is the
+    wrong column for "messages I sent". Filtering on your own address either matches
+    nothing — verified live for an email address: 0 rows against 85 outgoing messages
+    in the same window — or matches rows you did not send, because your own phone
+    number *does* appear as a handle (540 rows live, 501 of them ``isFromMe=false``).
+    Either way, filtering to the user's own messages has to go through
+    ``message.is_from_me``.
     """
     if from_me:
         return [{"statement": "message.is_from_me = :fromMe", "args": {"fromMe": 1}}]
@@ -70,6 +78,11 @@ class BlueBubblesClient:
         self._base_url = base_url.rstrip("/")
         self._password = password
         self._http = httpx.AsyncClient(timeout=timeout)
+        #: Whether this connection may send through the Private API. Assigned by the
+        #: server's ``lifespan`` once ``/server/info`` has been read, which is why it
+        #: is not an ``__init__`` parameter — the capability belongs to the server, not
+        #: to any individual send, so no call site chooses it.
+        self.private_api: bool = False
 
     async def close(self) -> None:
         await self._http.aclose()
@@ -80,6 +93,14 @@ class BlueBubblesClient:
     def _normalize_guid(chat_guid: str) -> str:
         """Normalize chat GUIDs: replace iMessage;-; prefix with any;-; for API compatibility."""
         return chat_guid.replace("iMessage;-;", "any;-;", 1)
+
+    def _send_method(self) -> str:
+        """The ``method`` every send route posts, decided by server capability.
+
+        AppleScript is the fallback because it needs no injected helper; it cannot
+        thread replies and fails outright against some SMS shortcodes.
+        """
+        return "private-api" if self.private_api else "apple-script"
 
     def _url(self, path: str) -> str:
         return f"{self._base_url}/api/v1{path}"
@@ -109,9 +130,14 @@ class BlueBubblesClient:
             raise BlueBubblesError(
                 self._error_message(resp, body),
                 body if isinstance(body, dict) else None,
+                status_code=resp.status_code,
             )
         if isinstance(body, dict) and body.get("status") and body["status"] >= 400:
-            raise BlueBubblesError(body.get("message", "Unknown error"), body)
+            raise BlueBubblesError(
+                body.get("message", "Unknown error"),
+                body,
+                status_code=int(body["status"]),
+            )
         return body.get("data") if isinstance(body, dict) else None
 
     @staticmethod
@@ -237,8 +263,9 @@ class BlueBubblesClient:
             params["before"] = before
         messages = await self._get(f"/chat/{chat_guid}/message", params=params)
         if from_me:
-            # `handle` names the OTHER party even on outgoing messages, so matching it
-            # against the account owner's own address never hits. Use the flag instead.
+            # `handle` names the OTHER party even on outgoing messages, so the account
+            # owner's own address is either absent from it (an email) or attached to
+            # rows they did not send (a phone number). Use the flag instead.
             return [m for m in messages if m.get("isFromMe")]
         if handle_address:
             messages = [
@@ -288,20 +315,25 @@ class BlueBubblesClient:
         self,
         chat_guid: str,
         message: str,
-        method: str = "apple-script",
         subject: str | None = None,
         reply_to_guid: str | None = None,
     ) -> dict[str, Any]:
+        """Send text to an existing chat.
+
+        ``reply_to_guid`` threads the reply, which only the Private API can express —
+        AppleScript has no equivalent, so the field is dropped rather than sent and
+        silently ignored.
+        """
         chat_guid = self._normalize_guid(chat_guid)
         body: dict[str, Any] = {
             "chatGuid": chat_guid,
             "tempGuid": f"temp-{uuid.uuid4().hex}",
             "message": message,
-            "method": method,
+            "method": self._send_method(),
         }
         if subject:
             body["subject"] = subject
-        if reply_to_guid and method != "apple-script":
+        if reply_to_guid and self.private_api:
             body["selectedMessageGuid"] = reply_to_guid
         return await self._post("/message/text", json=body)
 
@@ -310,20 +342,43 @@ class BlueBubblesClient:
         address: str,
         message: str,
         service: str = "iMessage",
-        method: str = "apple-script",
     ) -> dict[str, Any]:
-        if method == "apple-script":
-            # /chat/new requires Private API; use /message/text with the
-            # canonical any;-;<address> GUID for 1:1 chats instead.
-            return await self.send_message(f"any;-;{address}", message, method=method)
-        body: dict[str, Any] = {
-            "addresses": [address],
-            "message": message,
-            "method": method,
-            "service": service,
-            "tempGuid": f"temp-{uuid.uuid4().hex}",
-        }
-        return await self._post("/chat/new", json=body)
+        """Send to an address rather than to an existing chat.
+
+        ``service`` must already be canonical — exactly ``"SMS"`` or ``"iMessage"``.
+        The comparison below is case-sensitive, so the caller normalizes the casing
+        once instead of every layer guessing; anything else raises rather than
+        being coerced, because coercing here is how ``"sms"`` used to become an
+        iMessage send with no error and no note. Normalizing in two places is what
+        the single canonical point exists to avoid, so this only refuses.
+
+        **The return shape is polymorphic**, discriminated by the branch taken:
+
+        * SMS under the Private API posts ``/chat/new`` and returns a **chat** — its
+          ``guid`` is a chat GUID (``any;-;+15551234567``) and ``text`` is ``None``.
+          That route is the only one that pins the service, and it is needed because
+          ``/message/text`` cannot ask for SMS.
+        * Every other path posts ``/message/text`` with the canonical
+          ``any;-;<address>`` GUID and returns a **message**. ``any`` lets the server
+          choose the service, which is what makes SMS-only recipients work without
+          ``/chat/new`` — and ``/chat/new`` would force ``iMessage`` on them.
+        """
+        if service not in _SERVICES:
+            raise ValueError(
+                f"service must be one of {', '.join(sorted(_SERVICES))}; got "
+                f"{service!r}. Canonicalize it before calling — this method will "
+                "not guess, because guessing sends over the wrong transport."
+            )
+        if self.private_api and service == "SMS":
+            body: dict[str, Any] = {
+                "addresses": [address],
+                "message": message,
+                "method": self._send_method(),
+                "service": service,
+                "tempGuid": f"temp-{uuid.uuid4().hex}",
+            }
+            return await self._post("/chat/new", json=body)
+        return await self.send_message(f"any;-;{address}", message)
 
     async def send_reaction(
         self,
@@ -581,6 +636,7 @@ class BlueBubblesClient:
             raise BlueBubblesError(
                 self._error_message(resp, body),
                 body if isinstance(body, dict) else None,
+                status_code=resp.status_code,
             )
         return resp.content
 
@@ -590,7 +646,6 @@ class BlueBubblesClient:
         file_data: bytes,
         filename: str,
         mime_type: str = "application/octet-stream",
-        method: str = "apple-script",
     ) -> dict[str, Any]:
         resp = await self._http.post(
             self._url("/message/attachment"),
@@ -598,7 +653,7 @@ class BlueBubblesClient:
             data={
                 "chatGuid": self._normalize_guid(chat_guid),
                 "tempGuid": f"temp-{uuid.uuid4().hex}",
-                "method": method,
+                "method": self._send_method(),
                 "name": filename,
             },
             files={"attachment": (filename, file_data, mime_type)},
@@ -615,20 +670,29 @@ class BlueBubblesClient:
         chat_guid: str,
         message: str,
         scheduled_for: int,
-        method: str = "apple-script",
     ) -> dict[str, Any]:
         """Schedule a one-off message.
 
         The route wants a nested envelope, not the flat body the other send routes
         take: a bare ``{chatGuid, message, scheduledFor}`` is rejected outright with
         "The type field is required."
+
+        The method follows :meth:`_send_method` like every other send path, but note
+        that it is frozen here rather than resolved when the message fires. BlueBubbles
+        only auto-resolves the method when the field is absent, and its REST validator
+        rejects a payload without one, so the choice cannot be deferred to send time.
+
+        The tradeoff: a persisted ``private-api`` fails hard, with no fallback and no
+        retry, if the injected helper has dropped by the time the message fires. That
+        failure is durable and queryable — the scheduled-message record carries
+        ``status`` and ``error``, and the server emits ``scheduled-message-error``.
         """
         body: dict[str, Any] = {
             "type": "send-message",
             "payload": {
                 "chatGuid": self._normalize_guid(chat_guid),
                 "message": message,
-                "method": method,
+                "method": self._send_method(),
             },
             "scheduledFor": scheduled_for,
             "schedule": {"type": "once"},
@@ -640,8 +704,21 @@ class BlueBubblesClient:
 
 
 class BlueBubblesError(Exception):
+    """A response the server answered with, as opposed to a transport failure.
+
+    ``status_code`` is what the server said, when it said anything: callers that
+    must tell "this thing does not exist" apart from "the server is unreachable or
+    broken" have no other way to, since both arrive as this one exception type. It
+    is ``None`` only for an error built without a response.
+    """
+
     def __init__(
-        self, message: str, response_body: dict[str, Any] | None = None
+        self,
+        message: str,
+        response_body: dict[str, Any] | None = None,
+        *,
+        status_code: int | None = None,
     ) -> None:
         super().__init__(message)
         self.response_body = response_body
+        self.status_code = status_code

@@ -183,13 +183,96 @@ class TestCursorRoundTrip:
 
     @pytest.mark.parametrize(
         "bad",
-        ["", "   ", "not-a-cursor", "v1|only-two", "v1|a|b", "v9|1|2", "v1|1|2|3"],
+        [
+            "",
+            "   ",
+            "not-a-cursor",
+            "v1|only-two",
+            "v1|a|b",
+            "v9|1|2",
+            "v1|1|2|3",
+            "v2|1|2",
+            "v2|1|2|3|4",
+            # An empty scope normalises to None, which is what a GLOBAL poll expects —
+            # so without an explicit refusal this seeds a global walk from a token we
+            # never minted.
+            "v2|1|2|",
+            "v2|1|2|   ",
+        ],
     )
     def test_malformed_raises_rather_than_seeding(self, bad: str) -> None:
         # Never fall back to "now" or "the beginning of time": either would hide the
         # mistake behind a plausible-looking empty or enormous result.
         with pytest.raises(ValueError, match="verbatim"):
             Cursor.parse(bad, now_ms=NOW)
+
+
+CHAT = "iMessage;-;+15551234567"
+OTHER_CHAT = "iMessage;-;+15559998888"
+
+
+class TestCursorScope:
+    """Scope lives in the token, never on the dataclass.
+
+    Putting it on :class:`Cursor` would have `merge_monotonic` drop it field-wise and
+    would make `next_cursor != cursor` permanently true, destroying the stall signal.
+    """
+
+    def test_unscoped_encode_is_unchanged_v1(self) -> None:
+        assert Cursor(created_ms=111, changed_ms=222).encode() == "v1|111|222"
+
+    def test_scoped_encode_is_v2_with_the_normalized_chat(self) -> None:
+        token = Cursor(created_ms=111, changed_ms=222).encode(CHAT)
+        assert token == "v2|111|222|any;-;+15551234567"
+
+    def test_scoped_round_trip(self) -> None:
+        original = Cursor(created_ms=NOW - 5, changed_ms=NOW - 9)
+        parsed = Cursor.parse(original.encode(CHAT), now_ms=NOW, expect_scope=CHAT)
+        assert parsed == original
+
+    def test_scoped_encode_clamps_and_floors_like_the_global_path(self) -> None:
+        parsed = Cursor.parse(
+            f"v2|{NOW + 10_000}|-5|{CHAT}", now_ms=NOW, expect_scope=CHAT
+        )
+        assert (parsed.created_ms, parsed.changed_ms) == (NOW, 0)
+
+    def test_service_prefix_does_not_change_the_scope(self) -> None:
+        # Polling as `iMessage;-;X` and then `any;-;X` is the same query; a spurious
+        # mismatch there would break an agent that did nothing wrong.
+        assert Cursor(1, 2).encode(CHAT) == Cursor(1, 2).encode("any;-;+15551234567")
+        Cursor.parse(
+            Cursor(1, 2).encode(CHAT), now_ms=NOW, expect_scope="any;-;+15551234567"
+        )
+
+    def test_scoped_cursor_in_a_global_poll_raises(self) -> None:
+        with pytest.raises(ValueError, match="one cursor per scope"):
+            Cursor.parse(Cursor(1, 2).encode(CHAT), now_ms=NOW)
+
+    def test_global_cursor_in_a_scoped_poll_raises(self) -> None:
+        # Safe in isolation, but `advance_created` would move the global watermark to
+        # the last row in this chat and strand every other chat's messages behind it.
+        with pytest.raises(ValueError, match="one cursor per scope"):
+            Cursor.parse(Cursor(1, 2).encode(), now_ms=NOW, expect_scope=CHAT)
+
+    def test_another_chats_cursor_raises(self) -> None:
+        with pytest.raises(ValueError, match="one cursor per scope"):
+            Cursor.parse(Cursor(1, 2).encode(OTHER_CHAT), now_ms=NOW, expect_scope=CHAT)
+
+    def test_mismatch_does_not_tell_the_caller_to_echo_it_verbatim(self) -> None:
+        # `_BAD_CURSOR`'s advice is wrong here: the agent did echo it verbatim.
+        with pytest.raises(ValueError) as excinfo:
+            Cursor.parse(Cursor(1, 2).encode(CHAT), now_ms=NOW)
+        assert "verbatim" not in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        "seed", [NOW - 60_000, "1700000000", str(NOW - 1000), "2024-01-01T00:00:00Z"]
+    )
+    def test_seeds_are_scope_neutral(self, seed: str | int) -> None:
+        # Only encoded tokens carry scope. If a seed had to match, every FIRST scoped
+        # poll would fail.
+        assert Cursor.parse(seed, now_ms=NOW, expect_scope=CHAT) == Cursor.parse(
+            seed, now_ms=NOW
+        )
 
 
 class TestMergeMonotonic:

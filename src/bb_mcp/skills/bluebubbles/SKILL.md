@@ -65,15 +65,30 @@ For memory format, storage criteria, and group chat mappings — see [references
 
 ## Core Workflows
 
-### Follow a conversation over time
+### Getting updates in a chat
 ```
-get_recent_messages(minutes=60)           → first call; seeds the window
+get_recent_messages(chat_guid=<guid>, minutes=60)      → first call; seeds the window for this chat
   ...then on every subsequent call:
-get_recent_messages(since=<cursor>)       → only what is new or changed, no duplicates
+get_recent_messages(chat_guid=<guid>, since=<cursor>)  → only what is new or changed in THIS chat
   → pass the returned `cursor` back VERBATIM; never construct one
   → if has_more is true, call again IMMEDIATELY (there is a backlog)
   → `changed` holds edits and unsends of older messages; `messages` holds new ones
+
+Omit `chat_guid` to poll globally across every chat instead of one thread.
 ```
+- **To see what is NEW or CHANGED, always use `get_recent_messages`.** It is the only
+  tool that returns deltas — new messages plus edits and unsends, no duplicates.
+- **`get_chat_messages` is for browsing or backfilling history, not for following a
+  thread.** Its `after`/`before` filter `message.date` (creation time) only, so it
+  re-returns already-seen messages and can never show an edit or unsend.
+- **A cursor belongs to the scope it was minted in.** A cursor from a scoped
+  (`chat_guid`-bound) poll cannot be replayed as a global poll, and a global cursor
+  cannot be replayed as a scoped poll — either direction raises. Keep a separate cursor
+  per scope you are polling. A first call using `minutes=`/an epoch/an ISO date is
+  scope-neutral and works with or without `chat_guid`; only an already-encoded cursor
+  carries scope.
+- **A scoped poll cannot surface chat-less messages** (SMS shortcodes, 2FA senders) —
+  they have no `chat.guid` to match against. Use a global poll to catch those.
 
 ### Check messages
 ```
@@ -131,10 +146,15 @@ GUIDs identify conversations. The format encodes the chat type:
 
 ```
 User wants to check for NEW messages since last time, or follow a conversation?
-  → get_recent_messages(since=<cursor from the last response>)
-  → First call in a session: get_recent_messages(minutes=N)
+  → Following ONE chat: get_recent_messages(chat_guid=<guid>, since=<cursor>)
+  → Watching everything: get_recent_messages(since=<cursor>)  (omit chat_guid)
+  → First call in a session: get_recent_messages(chat_guid=<guid>?, minutes=N)
   → Pass the returned `cursor` back verbatim; if has_more is true, call again at once
   → This is the ONLY way to see edits and unsends of older messages
+  → Cursors are scope-bound: a cursor minted with `chat_guid` cannot be replayed
+    globally, and a global cursor cannot be replayed scoped — either way raises
+  → A scoped poll cannot see chat-less messages (SMS shortcodes, 2FA codes) — use a
+    global poll for those
 
 User wants a snapshot of what is unread right now?
   → get_unread_chats (messages already included)

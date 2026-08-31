@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
@@ -31,19 +32,54 @@ def ok_json(data: Any = None) -> httpx.Response:
     return httpx.Response(200, json={"status": 200, "data": data})
 
 
+def error_text(result: Any) -> str:
+    """What an errored tool call actually put in front of the model.
+
+    `is_error` alone would stay green if the check under test disappeared and some
+    unrelated failure took its place, which is most of what these tests are for.
+    """
+    return " ".join(getattr(block, "text", "") for block in result.content)
+
+
+#: Sentinel: `helper_connected` may legitimately be False or 0, so "not passed"
+#: cannot be expressed as a falsy default.
+_UNSET: Any = object()
+
+
 def server_info_ok(
-    private_api: bool = True, address: str = MY_ADDRESS
+    private_api: bool = True,
+    address: str = MY_ADDRESS,
+    helper_connected: Any = _UNSET,
 ) -> httpx.Response:
+    """A `/server/info` payload.
+
+    `helper_connected` defaults to mirroring `private_api` but is independently
+    settable: the helper drops whenever Messages.app restarts, and hard-wiring the
+    two together would hide the combination that decides the send path.
+    """
     return ok_json(
         {
             "private_api": private_api,
-            "helper_connected": private_api,
+            "helper_connected": (
+                private_api if helper_connected is _UNSET else helper_connected
+            ),
             "detected_imessage": address,
             "detected_icloud": address,
             "server_version": "1.9.0",
             "os_version": "14.0",
         }
     )
+
+
+def last_body(route: respx.Route) -> dict[str, Any]:
+    """The JSON body of a mocked route's most recent request.
+
+    Sends are asserted on the wire: the client is built inside `lifespan` and is
+    unreachable from an in-process `Client(mcp)`, so its flags cannot be read.
+    """
+    import json as _json
+
+    return dict(_json.loads(route.calls.last.request.content))
 
 
 def icloud_account_ok(
@@ -143,6 +179,73 @@ class TestProject:
         assert _project([], extended=True) == []
 
 
+class TestSendCapability:
+    """One source of truth for the send path: server info plus the override."""
+
+    def test_unset_means_auto(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from bb_mcp.server import _read_send_method
+
+        monkeypatch.delenv("BLUEBUBBLES_SEND_METHOD", raising=False)
+        assert _read_send_method() == "auto"
+
+    @pytest.mark.parametrize("value", ["auto", "apple-script", "private-api"])
+    def test_accepts_each_documented_value(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        from bb_mcp.server import _read_send_method
+
+        monkeypatch.setenv("BLUEBUBBLES_SEND_METHOD", value)
+        assert _read_send_method() == value
+
+    def test_typo_fails_loudly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`applescript` must not quietly mean `auto`."""
+        from bb_mcp.server import _read_send_method
+
+        monkeypatch.setenv("BLUEBUBBLES_SEND_METHOD", "applescript")
+        with pytest.raises(RuntimeError, match="BLUEBUBBLES_SEND_METHOD"):
+            _read_send_method()
+
+    def test_enabled_server_with_helper(self) -> None:
+        from bb_mcp.server import _send_capable
+
+        info = {"private_api": True, "helper_connected": True}
+        assert _send_capable(info, "auto") is True
+
+    def test_disconnected_helper_falls_back(self) -> None:
+        """A `private_api:true / helper_connected:false` server sends fine over
+        AppleScript; pinning on the toggle would fail every send there."""
+        from bb_mcp.server import _send_capable
+
+        info = {"private_api": True, "helper_connected": False}
+        assert _send_capable(info, "auto") is False
+
+    def test_helper_connected_zero_is_disconnected(self) -> None:
+        """Truthiness, not identity: a Node serializer emits 0, and `0 is not False`."""
+        from bb_mcp.server import _send_capable
+
+        info = {"private_api": True, "helper_connected": 0}
+        assert _send_capable(info, "auto") is False
+
+    def test_absent_helper_is_unknown_and_allows(self) -> None:
+        from bb_mcp.server import _send_capable
+
+        assert _send_capable({"private_api": True}, "auto") is True
+
+    def test_toggle_off_never_uses_private_api(self) -> None:
+        from bb_mcp.server import _send_capable
+
+        info = {"private_api": False, "helper_connected": True}
+        assert _send_capable(info, "auto") is False
+
+    def test_override_wins_in_both_directions(self) -> None:
+        from bb_mcp.server import _send_capable
+
+        enabled = {"private_api": True, "helper_connected": True}
+        disabled = {"private_api": False, "helper_connected": False}
+        assert _send_capable(enabled, "apple-script") is False
+        assert _send_capable(disabled, "private-api") is True
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -152,6 +255,11 @@ class TestProject:
 def bb_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BLUEBUBBLES_URL", BASE_URL)
     monkeypatch.setenv("BLUEBUBBLES_PASSWORD", PASSWORD)
+    # `just` loads .env (`set dotenv-load := true`) and .env.example invites operators
+    # to pin a send method there. Every connection below is built from this
+    # environment, so an unset var is as much a part of the fixture as the other two:
+    # otherwise the developer's own config decides what these tests assert.
+    monkeypatch.delenv("BLUEBUBBLES_SEND_METHOD", raising=False)
 
 
 @pytest.fixture
@@ -162,6 +270,27 @@ async def mcp_client(bb_env: None) -> AsyncGenerator[tuple[Client, respx.Router]
     with respx.mock(assert_all_called=False) as router:
         router.get(f"{API}/server/info").mock(
             return_value=server_info_ok(private_api=True)
+        )
+        router.get(f"{API}/icloud/account").mock(return_value=icloud_account_ok())
+        async with Client(mcp) as client:
+            yield client, router
+
+
+@asynccontextmanager
+async def bb_server(
+    private_api: bool = True, helper_connected: Any = _UNSET
+) -> AsyncGenerator[tuple[Client, respx.Router], None]:
+    """`mcp_client` with the `/server/info` capability fields under test control.
+
+    Callers must have applied `bb_env` (and any `BLUEBUBBLES_SEND_METHOD`) first.
+    """
+    from bb_mcp.server import mcp
+
+    with respx.mock(assert_all_called=False) as router:
+        router.get(f"{API}/server/info").mock(
+            return_value=server_info_ok(
+                private_api=private_api, helper_connected=helper_connected
+            )
         )
         router.get(f"{API}/icloud/account").mock(return_value=icloud_account_ok())
         async with Client(mcp) as client:
@@ -724,6 +853,325 @@ class TestGetRecentMessages:
         assert any("attribution" in n for n in result["notes"])
 
 
+class TestGetRecentMessagesScoped:
+    """`chat_guid` scoping: the wire, the cursor scope rule, and the GUID check."""
+
+    CHAT = "any;-;+15551230000"
+    OTHER = "any;-;+15559990000"
+
+    def _routes(
+        self,
+        router: respx.Router,
+        created: list[dict] | None = None,
+        changed: list[dict] | None = None,
+        *,
+        chat_exists: bool = True,
+    ) -> None:
+        import json as _json
+
+        def dispatch(request: httpx.Request) -> httpx.Response:
+            body = _json.loads(request.content)
+            statements = " ".join(w["statement"] for w in body.get("where", []))
+            if "message.guid IN" in statements:
+                return ok_json([])  # chat resolution
+            if "date_edited" in statements:
+                return ok_json(changed or [])
+            return ok_json(created or [])
+
+        router.post(f"{API}/message/query").mock(side_effect=dispatch)
+        for guid in (self.CHAT, self.OTHER):
+            router.get(f"{API}/chat/{guid}").mock(
+                return_value=ok_json(
+                    {"guid": guid, "displayName": "Family", "participants": ["x"]}
+                )
+                if chat_exists
+                else httpx.Response(404, json={"status": 404, "message": "not found"})
+            )
+
+    @staticmethod
+    def _query_bodies(router: respx.Router) -> list[dict[str, Any]]:
+        import json as _json
+
+        return [
+            _json.loads(call.request.content)
+            for call in router.calls
+            if call.request.method == "POST"
+        ]
+
+    async def test_scope_reaches_both_axes_on_the_wire(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        c, router = mcp_client
+        self._routes(router)
+        await c.call_tool(
+            "get_recent_messages",
+            {"minutes": 60, "chat_guid": "iMessage;-;+15551230000"},
+        )
+        bodies = self._query_bodies(router)
+        assert len(bodies) == 2
+        assert [b.get("chatGuid") for b in bodies] == [self.CHAT, self.CHAT]
+        statements = [" ".join(w["statement"] for w in b["where"]) for b in bodies]
+        assert any("date_edited" in s for s in statements)
+        assert any("date_edited" not in s for s in statements)
+
+    async def test_global_poll_sends_no_chat_guid(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        c, router = mcp_client
+        self._routes(router)
+        await c.call_tool("get_recent_messages", {"minutes": 60})
+        assert all("chatGuid" not in b for b in self._query_bodies(router))
+
+    async def test_scoped_cursor_is_refused_on_a_global_poll(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        c, router = mcp_client
+        self._routes(router)
+        scoped = (
+            await c.call_tool(
+                "get_recent_messages", {"minutes": 60, "chat_guid": self.CHAT}
+            )
+        ).data["cursor"]
+        assert scoped.startswith("v2|")
+        result = await c.call_tool(
+            "get_recent_messages", {"since": scoped}, raise_on_error=False
+        )
+        assert result.is_error
+        assert "one cursor per scope" in error_text(result)
+
+    async def test_global_cursor_is_refused_on_a_scoped_poll(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        c, router = mcp_client
+        self._routes(router)
+        unscoped = (await c.call_tool("get_recent_messages", {"minutes": 60})).data[
+            "cursor"
+        ]
+        assert unscoped.startswith("v1|")
+        result = await c.call_tool(
+            "get_recent_messages",
+            {"since": unscoped, "chat_guid": self.CHAT},
+            raise_on_error=False,
+        )
+        assert result.is_error
+        assert "one cursor per scope" in error_text(result)
+
+    async def test_another_chats_cursor_is_refused(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        c, router = mcp_client
+        self._routes(router)
+        mine = (
+            await c.call_tool(
+                "get_recent_messages", {"minutes": 60, "chat_guid": self.CHAT}
+            )
+        ).data["cursor"]
+        result = await c.call_tool(
+            "get_recent_messages",
+            {"since": mine, "chat_guid": self.OTHER},
+            raise_on_error=False,
+        )
+        assert result.is_error
+        message = error_text(result)
+        assert "one cursor per scope" in message
+        # Naming both scopes is the whole point: "some cursor is wrong" is not
+        # actionable when an agent is holding one per chat.
+        assert self.CHAT in message and self.OTHER in message
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            {"minutes": 60},
+            {"since": "1700000000000"},
+            {"since": "1700000000"},
+            {"since": "2023-11-14T22:13:20Z"},
+            {"since": "2023-11-14"},
+        ],
+    )
+    async def test_seeds_are_scope_neutral(
+        self, mcp_client: tuple[Client, respx.Router], args: dict[str, Any]
+    ) -> None:
+        """A seed adopts the requested scope; raising here breaks every first poll."""
+        c, router = mcp_client
+        self._routes(router)
+        result = await c.call_tool(
+            "get_recent_messages",
+            {**args, "chat_guid": self.CHAT},
+            raise_on_error=False,
+        )
+        assert not result.is_error
+        assert result.data["cursor"].startswith("v2|")
+
+    async def test_service_prefix_variants_are_one_scope(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        c, router = mcp_client
+        self._routes(router)
+        minted = (
+            await c.call_tool(
+                "get_recent_messages",
+                {"minutes": 60, "chat_guid": "iMessage;-;+15551230000"},
+            )
+        ).data["cursor"]
+        replayed = await c.call_tool(
+            "get_recent_messages",
+            {"since": minted, "chat_guid": "any;-;+15551230000"},
+            raise_on_error=False,
+        )
+        assert not replayed.is_error
+        assert self.CHAT in minted
+
+    async def test_unknown_chat_guid_is_rejected_before_it_polls_empty_forever(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        c, router = mcp_client
+        self._routes(router, chat_exists=False)
+        result = await c.call_tool(
+            "get_recent_messages",
+            {"minutes": 60, "chat_guid": self.CHAT},
+            raise_on_error=False,
+        )
+        assert result.is_error
+        assert "list_chats" in error_text(result)
+        # An empty result would look healthy forever, so nothing is even queried.
+        assert self._query_bodies(router) == []
+
+    async def test_scoped_rows_skip_the_chat_resolution_pass(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        c, router = mcp_client
+        self._routes(router, [{"guid": "m1", "dateCreated": 100}], [])
+        result = (
+            await c.call_tool(
+                "get_recent_messages", {"minutes": 60, "chat_guid": self.CHAT}
+            )
+        ).data
+        # The label carries the same fields a global poll's does — losing
+        # `displayName` would leave a caller unable to name the chat it just polled —
+        # and only those: `participants` is dropped exactly as `_slim_message` would.
+        assert result["messages"][0]["chats"] == [
+            {"guid": self.CHAT, "displayName": "Family"}
+        ]
+        # `no_chat` is 0 by construction when scoped: a chat-less message cannot
+        # match a chat GUID filter.
+        assert result["counts"]["no_chat"] == 0
+        statements = [
+            " ".join(w["statement"] for w in b["where"])
+            for b in self._query_bodies(router)
+        ]
+        assert not any("message.guid IN" in s for s in statements)
+
+    async def test_the_scope_check_happens_once_per_session(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        """A resumed scoped cursor was minted by a call that already checked."""
+        c, router = mcp_client
+        self._routes(router)
+        first = (
+            await c.call_tool(
+                "get_recent_messages", {"minutes": 60, "chat_guid": self.CHAT}
+            )
+        ).data["cursor"]
+        await c.call_tool(
+            "get_recent_messages", {"since": first, "chat_guid": self.CHAT}
+        )
+        chat_gets = [
+            call
+            for call in router.calls
+            if call.request.method == "GET" and "/chat/" in str(call.request.url)
+        ]
+        assert len(chat_gets) == 1
+
+    async def test_a_resumed_scoped_poll_still_labels_its_rows(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        """The cursor outlives the chat lookup, so a resumed poll repeats it.
+
+        Only when there is something to label, though: an empty poll — what a loop
+        does most of the time — still costs nothing beyond the two queries.
+        """
+        c, router = mcp_client
+        created: list[dict] = []
+        self._routes(router, created, [])
+        first = (
+            await c.call_tool(
+                "get_recent_messages", {"minutes": 60, "chat_guid": self.CHAT}
+            )
+        ).data["cursor"]
+        created.append({"guid": "m1", "dateCreated": 100})
+        result = (
+            await c.call_tool(
+                "get_recent_messages", {"since": first, "chat_guid": self.CHAT}
+            )
+        ).data
+        assert result["messages"][0]["chats"] == [
+            {"guid": self.CHAT, "displayName": "Family"}
+        ]
+        chat_gets = [
+            call
+            for call in router.calls
+            if call.request.method == "GET" and "/chat/" in str(call.request.url)
+        ]
+        # One for the empty first poll's scope check, one for the second poll's label.
+        assert len(chat_gets) == 2
+
+
+class TestScopeExistenceCheck:
+    """Only a missing chat may be reported as a missing chat.
+
+    The check runs on the first poll of a scope, which is exactly when the Mac has
+    just woken or BlueBubbles has just restarted. Answering a connection failure with
+    "get the chat GUID from list_chats" sends the model off to re-resolve a GUID that
+    was right all along — the misdirection this tool's advice exists to remove.
+    """
+
+    CHAT = "any;-;+15551230000"
+
+    async def _check(self, **mock: Any) -> dict[str, Any]:
+        from bb_mcp.client import BlueBubblesClient
+        from bb_mcp.server import _require_scope_chat
+
+        with respx.mock() as router:
+            router.get(f"{API}/chat/{self.CHAT}").mock(**mock)
+            client = BlueBubblesClient(BASE_URL, PASSWORD)
+            try:
+                return await _require_scope_chat(client, self.CHAT)
+            finally:
+                await client.close()
+
+    async def test_unknown_chat_is_reported_as_a_bad_guid(self) -> None:
+        with pytest.raises(ValueError, match="list_chats"):
+            await self._check(
+                return_value=httpx.Response(
+                    404, json={"status": 404, "message": "Chat does not exist!"}
+                )
+            )
+
+    async def test_transport_failure_is_not_relabelled_as_a_bad_guid(self) -> None:
+        from bb_mcp.client import BlueBubblesError
+
+        with pytest.raises(httpx.ConnectError) as excinfo:
+            await self._check(side_effect=httpx.ConnectError("connection refused"))
+        assert not isinstance(excinfo.value, (ValueError, BlueBubblesError))
+
+    async def test_gateway_timeout_is_not_relabelled_as_a_bad_guid(self) -> None:
+        from bb_mcp.client import BlueBubblesError
+
+        # A sleeping Mac behind a proxy: the GUID is fine, the server is not.
+        with pytest.raises(BlueBubblesError) as excinfo:
+            await self._check(return_value=httpx.Response(504, text="gateway timeout"))
+        assert "list_chats" not in str(excinfo.value)
+        assert excinfo.value.status_code == 504
+
+    async def test_returns_the_chat_it_read(self) -> None:
+        chat = await self._check(
+            return_value=ok_json(
+                {"guid": self.CHAT, "displayName": "Family", "participants": ["x"]}
+            )
+        )
+        assert chat == {"guid": self.CHAT, "displayName": "Family"}
+
+
 class TestGetUnreadChats:
     async def test_returns_list_with_expected_shape(
         self, mcp_client: tuple[Client, respx.Router]
@@ -855,11 +1303,28 @@ class TestSendMessage:
         self, mcp_client: tuple[Client, respx.Router]
     ) -> None:
         c, router = mcp_client
-        router.post(f"{API}/message/text").mock(return_value=ok_json({"guid": "m1"}))
+        route = router.post(f"{API}/message/text").mock(
+            return_value=ok_json({"guid": "m1"})
+        )
         result = await c.call_tool(
             "send_message", {"chat_guid": "g1", "message": "Hello"}
         )
         assert result.data["guid"] == "m1"
+        assert last_body(route)["method"] == "private-api"
+
+    async def test_reply_to_guid_reaches_the_wire(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        """The field the AppleScript path cannot express, and never used to send."""
+        c, router = mcp_client
+        route = router.post(f"{API}/message/text").mock(
+            return_value=ok_json({"guid": "m1"})
+        )
+        await c.call_tool(
+            "send_message",
+            {"chat_guid": "g1", "message": "Hello", "reply_to_guid": "parent"},
+        )
+        assert last_body(route)["selectedMessageGuid"] == "parent"
 
 
 class TestSendMessageToAddress:
@@ -876,6 +1341,164 @@ class TestSendMessageToAddress:
         )
         assert result.data["guid"] == "m1"
         assert route.called
+        assert last_body(route)["method"] == "private-api"
+
+    async def test_default_service_never_touches_chat_new(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        """`/chat/new` returns a chat, not a message, and would force iMessage on
+        SMS-only recipients — so only an explicit SMS request may take it."""
+        c, router = mcp_client
+        text = router.post(f"{API}/message/text").mock(
+            return_value=ok_json({"guid": "m1"})
+        )
+        new_chat = router.post(f"{API}/chat/new").mock(return_value=ok_json({}))
+        await c.call_tool(
+            "send_message_to_address",
+            {"address": "+15551234567", "message": "hi"},
+        )
+        assert text.called
+        assert not new_chat.called
+        assert last_body(text)["chatGuid"] == "any;-;+15551234567"
+
+    async def test_service_is_an_enum_in_the_tool_schema(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        """A bare `str` let "SMS/MMS" or "sms text" through, and everything
+        unrecognized was coerced to iMessage — the wrong transport, silently."""
+        c, _ = mcp_client
+        tool = next(
+            t for t in await c.list_tools() if t.name == "send_message_to_address"
+        )
+        assert tool.inputSchema["properties"]["service"]["enum"] == ["iMessage", "SMS"]
+
+    async def test_a_service_outside_the_enum_never_reaches_the_wire(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        c, router = mcp_client
+        text = router.post(f"{API}/message/text").mock(
+            return_value=ok_json({"guid": "m1"})
+        )
+        new_chat = router.post(f"{API}/chat/new").mock(return_value=ok_json({}))
+        for service in ("SMS/MMS", "sms text", "sms"):
+            result = await c.call_tool(
+                "send_message_to_address",
+                {"address": "+15551234567", "message": "hi", "service": service},
+                raise_on_error=False,
+            )
+            assert result.is_error, service
+        assert not text.called
+        assert not new_chat.called
+
+    async def test_sms_reaches_chat_new(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        """SMS is the one service the tool forwards; it takes the `/chat/new` route,
+        which is the only one that can pin the service."""
+        c, router = mcp_client
+        text = router.post(f"{API}/message/text").mock(
+            return_value=ok_json({"guid": "m1"})
+        )
+        new_chat = router.post(f"{API}/chat/new").mock(
+            return_value=ok_json({"guid": "any;-;+15551234567", "text": None})
+        )
+        result = await c.call_tool(
+            "send_message_to_address",
+            {"address": "+15551234567", "message": "hi", "service": "SMS"},
+        )
+        assert new_chat.called
+        assert not text.called
+        # The SMS branch returns a chat, which the docstring promises explicitly.
+        assert result.data["guid"] == "any;-;+15551234567"
+        body = last_body(new_chat)
+        assert body["service"] == "SMS"
+        assert body["method"] == "private-api"
+
+
+class TestSendMethod:
+    """The effective send method, asserted on the wire.
+
+    None of these cases mutate the tool set — every one reports `private_api: true`
+    — so they belong above `TestPrivateApiDisabled` rather than beside it.
+    """
+
+    @staticmethod
+    async def _method(c: Client, router: respx.Router) -> str:
+        route = router.post(f"{API}/message/text").mock(
+            return_value=ok_json({"guid": "m1"})
+        )
+        await c.call_tool("send_message", {"chat_guid": "g1", "message": "hi"})
+        return str(last_body(route)["method"])
+
+    async def test_auto_follows_an_enabled_server(self, bb_env: None) -> None:
+        async with bb_server(private_api=True) as (c, router):
+            assert await self._method(c, router) == "private-api"
+
+    async def test_auto_falls_back_when_the_helper_dropped(self, bb_env: None) -> None:
+        async with bb_server(private_api=True, helper_connected=False) as (c, router):
+            assert await self._method(c, router) == "apple-script"
+
+    async def test_auto_falls_back_on_integer_zero(self, bb_env: None) -> None:
+        async with bb_server(private_api=True, helper_connected=0) as (c, router):
+            assert await self._method(c, router) == "apple-script"
+
+    async def test_apple_script_override(
+        self, bb_env: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BLUEBUBBLES_SEND_METHOD", "apple-script")
+        async with bb_server(private_api=True) as (c, router):
+            assert await self._method(c, router) == "apple-script"
+
+    async def test_private_api_override(
+        self, bb_env: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BLUEBUBBLES_SEND_METHOD", "private-api")
+        async with bb_server(private_api=True, helper_connected=False) as (c, router):
+            assert await self._method(c, router) == "private-api"
+
+    async def test_invalid_value_fails_startup(
+        self, bb_env: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BLUEBUBBLES_SEND_METHOD", "applescript")
+        with pytest.raises(RuntimeError, match="BLUEBUBBLES_SEND_METHOD"):
+            async with bb_server(private_api=True):
+                pass
+
+    async def test_apple_script_override_does_not_drop_reply_to_guid(
+        self, bb_env: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The failure mode the shared capability exists to prevent.
+
+        Forcing AppleScript on a Private-API server used to leave the guard reading
+        the raw toggle while the client dropped `selectedMessageGuid` — the reply
+        would send, unthreaded, with nothing to show for it. It must refuse instead.
+        """
+        monkeypatch.setenv("BLUEBUBBLES_SEND_METHOD", "apple-script")
+        async with bb_server(private_api=True) as (c, router):
+            route = router.post(f"{API}/message/text").mock(
+                return_value=ok_json({"guid": "m1"})
+            )
+            result = await c.call_tool(
+                "send_message",
+                {"chat_guid": "g1", "message": "hi", "reply_to_guid": "parent"},
+                raise_on_error=False,
+            )
+            assert result.is_error
+            assert not route.called
+
+    async def test_apple_script_override_refuses_sms(
+        self, bb_env: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BLUEBUBBLES_SEND_METHOD", "apple-script")
+        async with bb_server(private_api=True) as (c, router):
+            new_chat = router.post(f"{API}/chat/new").mock(return_value=ok_json({}))
+            result = await c.call_tool(
+                "send_message_to_address",
+                {"address": "+15551234567", "message": "hi", "service": "SMS"},
+                raise_on_error=False,
+            )
+            assert result.is_error
+            assert not new_chat.called
 
 
 # ---------------------------------------------------------------------------
@@ -1025,6 +1648,36 @@ class TestDownloadAttachment:
 # ---------------------------------------------------------------------------
 # Scheduled message tools
 # ---------------------------------------------------------------------------
+
+
+class TestScheduledMessageDocs:
+    """The consequence of scheduling has to be in the tool docs, not only the skill.
+
+    A scheduled send freezes its method and fails hard, at a time nobody is watching,
+    if the Private API helper has dropped by then — and the listing tool is the only
+    thing that ever shows it. "Queued messages waiting to be sent" described a record
+    that may in fact be a send that already failed.
+    """
+
+    async def test_listing_documents_status_and_failure(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        c, _ = mcp_client
+        tools = {t.name: t.description or "" for t in await c.list_tools()}
+        listing = tools["list_scheduled_messages"]
+        assert "status" in listing
+        assert "'error'" in listing and "FAILED" in listing
+
+    async def test_scheduling_documents_the_frozen_method(
+        self, mcp_client: tuple[Client, respx.Router]
+    ) -> None:
+        c, _ = mcp_client
+        tools = {t.name: t.description or "" for t in await c.list_tools()}
+        scheduling = tools["schedule_message"]
+        assert "frozen" in scheduling
+        # Scheduling successfully is not delivery, and the docstring must say where
+        # the failure turns up rather than leaving the model to assume it went out.
+        assert "list_scheduled_messages" in scheduling
 
 
 class TestListScheduledMessages:
@@ -1178,6 +1831,44 @@ class TestPrivateApiDisabled:
             raise_on_error=False,
         )
         assert result.is_error
+
+    async def test_send_message_to_address_lowercase_sms_raises(
+        self, no_api_client: Client
+    ) -> None:
+        """Casing cannot slip past: the schema refuses anything but the two literals,
+        and the guard behind it compares the canonical value."""
+        result = await no_api_client.call_tool(
+            "send_message_to_address",
+            {"address": "+15551234567", "message": "hi", "service": "sms"},
+            raise_on_error=False,
+        )
+        assert result.is_error
+
+    async def test_sends_go_out_over_apple_script(self, no_api_client: Client) -> None:
+        with respx.mock(assert_all_called=False) as router:
+            route = router.post(f"{API}/message/text").mock(
+                return_value=ok_json({"guid": "m1"})
+            )
+            await no_api_client.call_tool(
+                "send_message", {"chat_guid": "g1", "message": "hi"}
+            )
+            assert last_body(route)["method"] == "apple-script"
+
+    async def test_send_message_to_address_stays_on_message_text(
+        self, no_api_client: Client
+    ) -> None:
+        with respx.mock(assert_all_called=False) as router:
+            text = router.post(f"{API}/message/text").mock(
+                return_value=ok_json({"guid": "m1"})
+            )
+            new_chat = router.post(f"{API}/chat/new").mock(return_value=ok_json({}))
+            await no_api_client.call_tool(
+                "send_message_to_address",
+                {"address": "+15551234567", "message": "hi"},
+            )
+            assert text.called
+            assert not new_chat.called
+            assert last_body(text)["method"] == "apple-script"
 
 
 # ---------------------------------------------------------------------------

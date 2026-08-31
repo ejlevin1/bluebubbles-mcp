@@ -8,7 +8,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import typer
 from fastmcp import Context, FastMCP
@@ -18,8 +18,9 @@ from fastmcp.utilities.types import Image
 from mcp.types import ToolAnnotations
 
 from bb_mcp import __version__
-from bb_mcp.client import BlueBubblesClient
+from bb_mcp.client import BlueBubblesClient, BlueBubblesError
 from bb_mcp.cursor import (
+    CURSOR_VERSIONS,
     MAX_PAGE,
     Cursor,
     advance_changed,
@@ -84,6 +85,48 @@ PRIVATE_API_TOOLS = [
     "mark_chat_read",
     "mark_chat_unread",
 ]
+
+
+#: Accepted values for ``BLUEBUBBLES_SEND_METHOD``. ``auto`` follows the server.
+SEND_METHODS = ("auto", "apple-script", "private-api")
+
+
+def _read_send_method() -> str:
+    """Read and validate ``BLUEBUBBLES_SEND_METHOD``.
+
+    Validated at startup rather than at send time: a typo'd ``applescript`` that
+    quietly meant ``auto`` would be indistinguishable from working configuration
+    until a send behaved unexpectedly, which is the class of bug this whole knob
+    exists to make visible.
+    """
+    raw = (os.environ.get("BLUEBUBBLES_SEND_METHOD") or "auto").strip().lower()
+    if raw not in SEND_METHODS:
+        raise RuntimeError(
+            "BLUEBUBBLES_SEND_METHOD must be one of "
+            f"{', '.join(SEND_METHODS)}; got {raw!r}."
+        )
+    return raw
+
+
+def _send_capable(info: dict[str, Any], send_method: str) -> bool:
+    """Whether sends on this connection may go out over the Private API.
+
+    ``private_api`` is the config toggle; ``helper_connected`` reports whether the
+    injected helper is actually attached, and it drops whenever Messages.app
+    restarts. A ``private_api: true / helper_connected: false`` server still sends
+    perfectly well over AppleScript, so pinning on the toggle alone would fail
+    every send there with the very error this capability check removes.
+
+    Truthiness, not identity: a Node JSON serializer is free to emit
+    ``helper_connected: 0``, which ``is not False`` and would slip through an
+    identity test. An absent field is unknown rather than disconnected — older
+    servers do not report it at all — so it allows.
+    """
+    if send_method != "auto":
+        return send_method == "private-api"
+    helper = info.get("helper_connected")
+    connected = True if helper is None else bool(helper)
+    return bool(info.get("private_api")) and connected
 
 
 def _account_aliases(account: Any) -> list[str]:
@@ -183,8 +226,23 @@ async def lifespan(server: FastMCP):
         raise RuntimeError(
             "BLUEBUBBLES_URL and BLUEBUBBLES_PASSWORD environment variables are required"
         )
+    send_method = _read_send_method()
     client = BlueBubblesClient(url, password)
     info = await client.server_info()
+    # The send path and the Private-API *routes* are separate questions: the
+    # routes below follow the raw toggle, sends follow the capability, which also
+    # accounts for the helper and for the operator's override.
+    send_private_api = _send_capable(info, send_method)
+    client.private_api = send_private_api
+    if send_private_api != bool(info.get("private_api")):
+        logger.warning(
+            "Sends will use %s (BLUEBUBBLES_SEND_METHOD=%s, private_api=%s, "
+            "helper_connected=%s).",
+            "the Private API" if send_private_api else "AppleScript",
+            send_method,
+            info.get("private_api"),
+            info.get("helper_connected"),
+        )
     if not info.get("private_api"):
         logger.warning(
             "BlueBubbles Private API is not enabled (helper_connected=%s). "
@@ -212,6 +270,7 @@ async def lifespan(server: FastMCP):
         yield {
             "bb": client,
             "private_api": bool(info.get("private_api")),
+            "send_private_api": send_private_api,
             "me": identity["address"],
             "identity": identity,
         }
@@ -231,7 +290,11 @@ mcp = FastMCP(
         "iMessage or FaceTime availability for a phone number or email.\n\n"
         "To follow conversations over time, poll get_recent_messages and pass the cursor "
         "it returns back as `since` — that is the only way to see new messages, edits, and "
-        "unsends without re-reading what you already have.\n\n"
+        "unsends without re-reading what you already have. To follow one thread, pass that "
+        "thread's `chat_guid` to the same tool rather than re-reading it with "
+        "get_chat_messages. A cursor belongs to the scope it was minted in: keep one cursor "
+        "per chat plus one for the unscoped poll, and never move a cursor between scopes — "
+        "doing so raises rather than silently skipping messages.\n\n"
         "Not for: email, phone/FaceTime calls, or other platforms (Slack, WhatsApp, Telegram).\n\n"
         "All sends, reactions, and read receipts are real and visible to the other person. "
         "Always confirm with the user before destructive actions (delete chat, unsend message, "
@@ -262,15 +325,42 @@ def _bb(ctx: Context) -> BlueBubblesClient:
     return ctx.lifespan_context["bb"]
 
 
-def _private_api(ctx: Context) -> bool:
-    return ctx.lifespan_context["private_api"]
+def _send_private_api(ctx: Context) -> bool:
+    """Whether *sends* go out over the Private API on this connection.
+
+    Distinct from the raw ``private_api`` toggle that gates Private-API *routes*,
+    which ``lifespan`` reads straight off ``/server/info``: the send path
+    additionally depends on the injected helper being attached and on
+    ``BLUEBUBBLES_SEND_METHOD``. Anything
+    whose behaviour changes with the send method must read this one — it is the
+    same value the client's ``private_api`` flag was assigned in ``lifespan``, so
+    a guard here can never disagree with what the client puts on the wire.
+    """
+    return ctx.lifespan_context["send_private_api"]
+
+
+def _canonical_service(service: str) -> Literal["iMessage", "SMS"]:
+    """Canonicalize a service name to exactly ``"SMS"`` or ``"iMessage"``.
+
+    The client compares case-sensitively against ``"SMS"`` and puts the value on
+    the wire, so the casing is settled once, here. The tool parameter is a
+    ``Literal``, so the model cannot express anything else in the first place —
+    this stays as the single canonical point for every other caller, and because a
+    coercing fallback is what once turned an unrecognized service into a silent
+    iMessage send.
+    """
+    return "SMS" if service.strip().upper() == "SMS" else "iMessage"
 
 
 def _sender_filter(ctx: Context, address: str | None) -> tuple[str | None, bool]:
     """Split a `from_address` into (handle_address, from_me).
 
     'me' cannot be expressed as a handle: `handle` names the OTHER party even on
-    outgoing messages, so filtering on the user's own address matches nothing.
+    outgoing messages. Filtering on the user's own address either matches nothing
+    (an email address: 0 rows against 85 outgoing messages in the same window) or
+    matches rows the user did not send, because their own phone number *does*
+    appear as a handle (540 rows live, 501 of them `isFromMe=false`). Either way
+    it is the wrong column, so 'me' routes to `message.is_from_me` instead.
     """
     if address is None:
         return None, False
@@ -332,6 +422,71 @@ def _slim_message(msg: dict[str, Any]) -> dict[str, Any]:
 
 def _project(data: list[dict[str, Any]], extended: bool) -> list[dict[str, Any]]:
     return data if extended else [_slim_message(m) for m in data]
+
+
+def _scope_guid(chat_guid: str | None) -> str | None:
+    """The one normalised chat scope a call uses everywhere, or ``None`` if global.
+
+    Normalising once matters: the cursor scope key, the two ``/message/query`` bodies
+    and the chat stamped onto each row all have to agree, and ``iMessage;-;X`` and
+    ``any;-;X`` are the same chat.
+    """
+    if not chat_guid or not chat_guid.strip():
+        return None
+    return BlueBubblesClient._normalize_guid(chat_guid.strip())
+
+
+def _is_encoded_cursor(since: str | None) -> bool:
+    """True when ``since`` is a token this server minted, not a human-typed seed."""
+    if not isinstance(since, str):
+        return False
+    return since.strip().partition("|")[0] in CURSOR_VERSIONS
+
+
+async def _scope_chat(bb: BlueBubblesClient, chat_guid: str) -> dict[str, Any]:
+    """Read the scoped chat, slimmed to the fields a row's ``chats`` entry carries.
+
+    One read serves two purposes: it proves the scope exists (see
+    :func:`_require_scope_chat`) and it is the label every row of that poll gets,
+    which is why it keeps ``displayName`` rather than just the GUID.
+    """
+    chat = await bb.get_chat(chat_guid)
+    slim = {k: v for k, v in chat.items() if k in _SLIM_CHAT_FIELDS} if chat else {}
+    slim.setdefault("guid", chat_guid)
+    return slim
+
+
+async def _require_scope_chat(bb: BlueBubblesClient, chat_guid: str) -> dict[str, Any]:
+    """Fail loudly on a chat scope that would otherwise poll empty forever.
+
+    Unlike ``GET /chat/{guid}``, ``/message/query`` answers an unknown ``chatGuid``
+    with ``[]`` rather than a 404 — a healthy-looking poll that returns nothing for
+    the rest of the session. That is exactly the plausible empty result
+    :meth:`Cursor.parse` refuses to invent, so the scope gets the same treatment.
+
+    Only a *not found* answer means the GUID is wrong, and 404 is the whole of that
+    answer: verified live, an unknown-but-well-formed GUID and outright garbage both
+    come back 404 "Chat does not exist!". A connection failure or a gateway timeout —
+    the Mac asleep, BlueBubbles restarting — says nothing about the GUID, so it
+    propagates unchanged rather than being relabelled as one: telling the model to go
+    re-resolve a GUID that was correct all along is the exact misdirection this tool's
+    advice exists to remove.
+
+    Called once per polling session (a resumed scoped cursor was minted by a call that
+    already checked), so a loop pays for this at most once.
+    """
+    try:
+        return await _scope_chat(bb, chat_guid)
+    except BlueBubblesError as exc:
+        if exc.status_code != 404:
+            raise
+        raise ValueError(
+            f"Could not read chat {chat_guid!r} ({exc}). A scoped poll cannot detect "
+            "this itself: the message query answers an unknown chat with an empty "
+            "result rather than an error, so it would keep looking healthy and return "
+            "nothing. Get the chat GUID from list_chats or search_messages and pass "
+            "the `guid` they report."
+        ) from exc
 
 
 async def _attach_chats(
@@ -478,7 +633,8 @@ async def get_chat_messages(
 
     `after` is a fixed time window, not a cursor — repeated calls re-read the same
     messages and never show edits or unsends. To follow a conversation over time, use
-    get_recent_messages with its cursor.
+    get_recent_messages with its cursor, passing this `chat_guid` to scope it to this
+    one thread. Use this tool for browsing or backfilling history instead.
 
     Args:
         chat_guid: The chat GUID.
@@ -517,6 +673,7 @@ async def get_recent_messages(
     since: str | None = None,
     minutes: int | None = None,
     limit: int = 50,
+    chat_guid: str | None = None,
     from_address: str | None = None,
     extended: bool = False,
 ) -> dict[str, Any]:
@@ -527,6 +684,12 @@ async def get_recent_messages(
     response back as `since`, and each call returns only what is new or changed since
     then — including edits and unsends of older messages, which a plain time window
     cannot see at all. Omit `since` for a first look at a recent time window.
+
+    To follow ONE conversation, pass its `chat_guid` here rather than re-reading the
+    thread with get_chat_messages. A cursor is a time watermark for the scope it was
+    minted in, so each scope keeps its own: a scoped cursor replayed on an unscoped
+    call (or on a different chat) raises rather than silently skipping everything the
+    other scope saw meanwhile. Start a new scope by calling without `since`.
 
     Do NOT poll by calling this again with `minutes`. That re-reads the same messages
     every time, wastes context on duplicates, and never surfaces edits or unsends.
@@ -539,7 +702,11 @@ async def get_recent_messages(
         has_more: True means there is a backlog — call again IMMEDIATELY with the new
                   cursor rather than waiting for your next poll interval.
         cursor_advanced: False means nothing was consumed; check `notes` and back off.
-        counts, notes: Totals and any warnings worth surfacing.
+        counts, notes: Totals and any warnings worth surfacing. `counts.no_chat` is
+                  the number of messages belonging to no chat row — SMS shortcodes and
+                  2FA senders. It is structurally 0 when `chat_guid` is set, since
+                  filtering on a chat GUID can only match messages that have one, so
+                  do not read it as evidence there were none.
 
     Args:
         since: Resume token. Pass the `cursor` string from a previous response
@@ -548,6 +715,10 @@ async def get_recent_messages(
                When set, `minutes` is ignored.
         minutes: How far back to look when `since` is omitted (default 60).
         limit: Max messages per axis per call (default 50, max 999).
+        chat_guid: Restrict the poll to one conversation. A cursor minted with this
+                   set only works with this same chat; mixing scopes raises. An
+                   unknown GUID is rejected on the first call of a scope, because the
+                   underlying query answers one with an empty result, not an error.
         from_address: Only messages from this sender. Pass an E.164 phone number or
                       email (e.g. '+15551234567'), or 'me' for the user's own messages.
                       Server-side filter.
@@ -560,13 +731,21 @@ async def get_recent_messages(
     page = max(1, min(int(limit), MAX_PAGE))
     notes: list[str] = []
 
+    scope = _scope_guid(chat_guid)
+
     if since is not None:
-        cursor = Cursor.parse(since, now_ms=now_ms)
+        cursor = Cursor.parse(since, now_ms=now_ms, expect_scope=scope)
         if minutes is not None:
             notes.append("`minutes` was ignored because `since` was provided.")
     else:
         window = 60 if minutes is None else max(1, int(minutes))
         cursor = Cursor.seed(now_ms - window * 60_000)
+
+    # Seeds are scope-neutral, so this is the first call of a scope whenever `since`
+    # is not one of our own tokens — the only moment the scope has not been checked.
+    scope_chat: dict[str, Any] | None = None
+    if scope is not None and not _is_encoded_cursor(since):
+        scope_chat = await _require_scope_chat(bb, scope)
 
     handle_address, from_me = _sender_filter(ctx, from_address)
 
@@ -574,6 +753,7 @@ async def get_recent_messages(
         return await bb.query_created_since(
             since_ms=cursor.created_ms,
             limit=page_size,
+            chat_guid=scope,
             handle_address=handle_address,
             from_me=from_me,
         )
@@ -582,6 +762,7 @@ async def get_recent_messages(
         return await bb.query_changed_since(
             since_ms=cursor.changed_ms,
             limit=page_size,
+            chat_guid=scope,
             handle_address=handle_address,
             from_me=from_me,
         )
@@ -637,13 +818,37 @@ async def get_recent_messages(
     notes.extend(monotonic_notes)
 
     reactions = summarize_reactions(created.rows)
-    no_chat = await _attach_chats(bb, [*created.rows, *changed_rows], notes)
+    rows = [*created.rows, *changed_rows]
+    if scope is None:
+        no_chat = await _attach_chats(bb, rows, notes)
+    else:
+        # Scoped rows came back through a join on chat.guid, so the chat is already
+        # known and the per-row resolve pass could only re-derive it. Skipping it
+        # matters most here: this is the tool designed to run in a loop, and an empty
+        # poll — the common case in one — now costs no extra request at all. It also
+        # makes `no_chat` structurally 0: a chat-less message cannot match a chat GUID.
+        #
+        # The label still carries what a global poll's does (`displayName` included),
+        # so a caller can say "new message in Family" without another lookup. The
+        # scope check already fetched it on the first call of a scope; a resumed
+        # cursor pays one read, and only when there is something to label.
+        if rows and scope_chat is None:
+            try:
+                scope_chat = await _scope_chat(bb, scope)
+            except Exception as exc:  # noqa: BLE001 - a label must not cost the cursor
+                notes.append(
+                    f"Chat details unavailable this poll ({type(exc).__name__}); "
+                    "messages are complete but labelled with the GUID only."
+                )
+        for row in rows:
+            row["chats"] = [dict(scope_chat or {"guid": scope})]
+        no_chat = 0
 
     return {
         "messages": _project(created.rows, extended),
         "changed": _project(changed_rows, extended),
         "reactions": reactions,
-        "cursor": next_cursor.encode(),
+        "cursor": next_cursor.encode(scope),
         "has_more": created.truncated or changed_truncated,
         "cursor_advanced": next_cursor != cursor,
         "counts": {
@@ -672,7 +877,7 @@ async def get_unread_chats(
     their phone. It is not a record of what you have already seen: a message you
     already handled can still be unread, and one you have never seen can already be
     read. To track what is new to YOU across calls, use get_recent_messages and its
-    cursor instead.
+    cursor instead — with `chat_guid` once you are following one of these threads.
 
     Args:
         message_limit: Number of recent messages to include per unread chat (default 5).
@@ -777,9 +982,11 @@ async def send_message(
         message: The message text.
         reply_to_guid: Message GUID to reply to, creating a thread.
     """
-    if reply_to_guid and not _private_api(ctx):
+    if reply_to_guid and not _send_private_api(ctx):
         raise ValueError(
-            "Threaded replies require the BlueBubbles Private API, which is not enabled on this server."
+            "Threaded replies require the BlueBubbles Private API send path, which is not "
+            "active on this connection (the server's Private API is off, its helper is "
+            "disconnected, or BLUEBUBBLES_SEND_METHOD pins sends to AppleScript)."
         )
     return await _bb(ctx).send_message(chat_guid, message, reply_to_guid=reply_to_guid)
 
@@ -789,21 +996,33 @@ async def send_message_to_address(
     ctx: Context,
     address: str,
     message: str,
-    service: str = "iMessage",
+    service: Literal["iMessage", "SMS"] = "iMessage",
 ) -> dict[str, Any]:
     """Send an iMessage or SMS text message to a phone number or email address.
 
     Sends an Apple iMessage or SMS text to a mobile phone number or email, creating
     a new chat thread if one does not already exist on the bridged iPhone/Mac.
 
+    The returned object differs by service, so read it accordingly:
+
+    - service='iMessage' (the default) returns the **sent message**: `guid` is a
+      message GUID and `text` is what was sent. `error` is 0 on success.
+    - service='SMS' returns the **chat** the message went to: `guid` is a chat GUID
+      (e.g. 'any;-;+15551234567'), `text` is absent or null, and the message itself
+      is not included. A returned chat means the send was accepted.
+
     Args:
         address: Phone number (e.g. '+15551234567') or email address.
         message: The message text.
-        service: 'iMessage' or 'SMS' (default iMessage).
+        service: 'iMessage' or 'SMS' (default iMessage). No other value exists —
+                 there is no 'SMS/MMS' or 'text'; SMS covers both.
     """
-    if service.upper() == "SMS" and not _private_api(ctx):
+    service = _canonical_service(service)
+    if service == "SMS" and not _send_private_api(ctx):
         raise ValueError(
-            "SMS service requires the BlueBubbles Private API, which is not enabled on this server."
+            "SMS service requires the BlueBubbles Private API send path, which is not "
+            "active on this connection (the server's Private API is off, its helper is "
+            "disconnected, or BLUEBUBBLES_SEND_METHOD pins sends to AppleScript)."
         )
     return await _bb(ctx).send_message_to_address(address, message, service=service)
 
@@ -1072,7 +1291,13 @@ async def leave_chat(ctx: Context, chat_guid: str) -> str:
 async def list_scheduled_messages(ctx: Context) -> list[dict[str, Any]]:
     """List all scheduled future iMessage and SMS text messages.
 
-    Returns queued messages waiting to be sent via the BlueBubbles iMessage/SMS bridge.
+    Returns every scheduled record the BlueBubbles iMessage/SMS bridge holds — which
+    is not the same as messages still waiting to go out. Read `status` on each one:
+    'pending' is queued, 'in-progress' is firing, 'complete' was sent, and 'error'
+    means the send already FAILED, with the reason in `error` and the attempt time in
+    `sentAt`. The bridge announces such a failure only as a live event nobody here is
+    listening for, so this tool is the only way to discover one. Check it before
+    telling the user a scheduled message went out.
     """
     return await _bb(ctx).list_scheduled_messages()
 
@@ -1088,6 +1313,13 @@ async def schedule_message(
 
     Queues an Apple iMessage or SMS text to be delivered automatically at the
     specified time via the BlueBubbles bridge.
+
+    Scheduling successfully is NOT delivery. The send method is frozen into the
+    record now and replayed verbatim whenever it fires — the bridge cannot re-decide
+    it later — so a message scheduled while the Private API is active fails hard,
+    with no fallback and no retry, if the injected helper has dropped by then
+    (Messages.app restarting is enough). Nothing announces that at the time. Confirm
+    with list_scheduled_messages, where the record turns up as status 'error'.
 
     Args:
         chat_guid: The iMessage or SMS chat GUID to send to.
