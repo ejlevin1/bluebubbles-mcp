@@ -143,10 +143,17 @@ async def test_server_health(c: Client) -> Suite:
     s.check("server_version" in info, "get_server_info has server_version")
     s.check("private_api" in info, "get_server_info has private_api flag")
 
-    addr = _data(await c.call_tool("get_my_address", {}))
+    me = _data(await c.call_tool("get_my_address", {}))
+    s.check(isinstance(me, dict), f"get_my_address returns dict: {type(me).__name__}")
+    addr = me.get("address") if isinstance(me, dict) else None
     s.check(
         isinstance(addr, str) and len(addr) > 0,
-        f"get_my_address returns non-empty string: {addr!r}",
+        f"get_my_address.address is a non-empty string: {addr!r}",
+    )
+    addresses = me.get("addresses") if isinstance(me, dict) else None
+    s.check(
+        isinstance(addresses, list) and addr in addresses,
+        f"get_my_address.addresses leads with address: {addresses!r}",
     )
 
     return s
@@ -531,7 +538,8 @@ async def _run(send: bool) -> None:
 
     async with Client(mcp) as c:
         # Always need my_address for filter tests
-        my_address: str = _data(await c.call_tool("get_my_address", {})) or ""
+        me = _data(await c.call_tool("get_my_address", {})) or {}
+        my_address: str = (me.get("address") if isinstance(me, dict) else None) or ""
 
         s_health = await test_server_health(c)
         suites.append(s_health)

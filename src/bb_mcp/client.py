@@ -168,6 +168,24 @@ class BlueBubblesClient:
     async def server_info(self) -> Any:
         return await self._get("/server/info")
 
+    async def icloud_account(self, timeout: float = 8.0) -> Any:
+        """Signed-in iCloud account: aliases, active alias, display name.
+
+        Private API only — without it the route 500s. Carries the full set of
+        addresses Apple accepts for this account, which ``/server/info`` does not:
+        it reports a single detected address and silently drops the rest.
+
+        Uses a shorter timeout than the client default. This runs during startup,
+        and it is answered by the injected helper rather than the server proper, so
+        a wedged helper would otherwise hold the whole handshake open for 30s.
+        """
+        resp = await self._http.get(
+            self._url("/icloud/account"),
+            params=self._auth_params(),
+            timeout=timeout,
+        )
+        return self._handle(resp)
+
     # -- chats ----------------------------------------------------------------
 
     async def list_chats(

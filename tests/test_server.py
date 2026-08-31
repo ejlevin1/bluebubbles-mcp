@@ -46,6 +46,24 @@ def server_info_ok(
     )
 
 
+def icloud_account_ok(
+    active: str = MY_ADDRESS,
+    aliases: list[str] | None = None,
+    name: str | None = "Test User",
+) -> httpx.Response:
+    return ok_json(
+        {
+            "account_name": name,
+            "active_alias": active,
+            "apple_id": "test@example.com",
+            "aliases": [
+                {"Alias": a, "Status": 3, "IsUserVisible": True}
+                for a in (aliases if aliases is not None else [active])
+            ],
+        }
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pure function tests — no server needed
 # ---------------------------------------------------------------------------
@@ -145,6 +163,7 @@ async def mcp_client(bb_env: None) -> AsyncGenerator[tuple[Client, respx.Router]
         router.get(f"{API}/server/info").mock(
             return_value=server_info_ok(private_api=True)
         )
+        router.get(f"{API}/icloud/account").mock(return_value=icloud_account_ok())
         async with Client(mcp) as client:
             yield client, router
 
@@ -160,7 +179,9 @@ class TestGetMyAddress:
     ) -> None:
         c, _ = mcp_client
         result = await c.call_tool("get_my_address", {})
-        assert result.data == MY_ADDRESS
+        assert result.data["address"] == MY_ADDRESS
+        assert result.data["addresses"] == [MY_ADDRESS]
+        assert result.data["source"] == "icloud_account"
 
     async def test_raises_when_no_address(self, bb_env: None) -> None:
         from bb_mcp.server import mcp
@@ -178,6 +199,122 @@ class TestGetMyAddress:
             async with Client(mcp) as c:
                 result = await c.call_tool("get_my_address", {}, raise_on_error=False)
                 assert result.is_error
+
+
+class TestIdentityResolution:
+    """`_resolve_identity` enriches from the Private API but must never depend on it."""
+
+    @staticmethod
+    async def _resolve(
+        router: respx.Router, private_api: bool = True, override: str | None = None
+    ) -> dict[str, Any]:
+        from bb_mcp.client import BlueBubblesClient
+        from bb_mcp.server import _resolve_identity
+
+        info = server_info_ok(private_api=private_api).json()["data"]
+        client = BlueBubblesClient(BASE_URL, PASSWORD)
+        try:
+            return await _resolve_identity(client, info, override)
+        finally:
+            await client.close()
+
+    async def test_aliases_lead_with_active_alias(self) -> None:
+        with respx.mock(assert_all_called=False) as router:
+            router.get(f"{API}/icloud/account").mock(
+                return_value=icloud_account_ok(
+                    active="+15551110000",
+                    aliases=["me@example.com", "+15551110000"],
+                )
+            )
+            identity = await self._resolve(router)
+        # active_alias is the address Apple sends from, so it is the primary.
+        assert identity["address"] == "+15551110000"
+        assert identity["addresses"][0] == "+15551110000"
+        assert "me@example.com" in identity["addresses"]
+        assert identity["name"] == "Test User"
+        assert identity["source"] == "icloud_account"
+
+    async def test_detected_address_is_kept_alongside_aliases(self) -> None:
+        """The /server/info address must survive even if Apple omits it."""
+        with respx.mock(assert_all_called=False) as router:
+            router.get(f"{API}/icloud/account").mock(
+                return_value=icloud_account_ok(active="+15551110000", aliases=[])
+            )
+            identity = await self._resolve(router)
+        assert MY_ADDRESS in identity["addresses"]
+
+    async def test_hidden_aliases_are_dropped(self) -> None:
+        with respx.mock(assert_all_called=False) as router:
+            router.get(f"{API}/icloud/account").mock(
+                return_value=ok_json(
+                    {
+                        "account_name": "Test User",
+                        "active_alias": "+15551110000",
+                        "aliases": [
+                            {"Alias": "+15551110000", "IsUserVisible": True},
+                            {"Alias": "hidden@icloud.com", "IsUserVisible": False},
+                        ],
+                    }
+                )
+            )
+            identity = await self._resolve(router)
+        assert "hidden@icloud.com" not in identity["addresses"]
+
+    async def test_no_duplicates_across_sources(self) -> None:
+        with respx.mock(assert_all_called=False) as router:
+            router.get(f"{API}/icloud/account").mock(
+                return_value=icloud_account_ok(active=MY_ADDRESS)
+            )
+            identity = await self._resolve(router)
+        assert identity["addresses"] == [MY_ADDRESS]
+
+    async def test_private_api_off_skips_the_call_entirely(self) -> None:
+        with respx.mock(assert_all_called=False) as router:
+            route = router.get(f"{API}/icloud/account").mock(
+                return_value=icloud_account_ok()
+            )
+            identity = await self._resolve(router, private_api=False)
+        assert not route.called, "must not hit a Private API route when PA is off"
+        assert identity["address"] == MY_ADDRESS
+        assert identity["source"] == "server_info"
+
+    async def test_falls_back_when_icloud_route_errors(self) -> None:
+        with respx.mock(assert_all_called=False) as router:
+            router.get(f"{API}/icloud/account").mock(
+                return_value=httpx.Response(500, json={"status": 500})
+            )
+            identity = await self._resolve(router)
+        assert identity["address"] == MY_ADDRESS
+        assert identity["source"] == "server_info"
+
+    async def test_falls_back_when_icloud_route_times_out(self) -> None:
+        with respx.mock(assert_all_called=False) as router:
+            router.get(f"{API}/icloud/account").mock(
+                side_effect=httpx.ReadTimeout("helper wedged")
+            )
+            identity = await self._resolve(router)
+        assert identity["address"] == MY_ADDRESS
+        assert identity["source"] == "server_info"
+
+    async def test_survives_a_malformed_payload(self) -> None:
+        with respx.mock(assert_all_called=False) as router:
+            router.get(f"{API}/icloud/account").mock(
+                return_value=ok_json({"aliases": "not-a-list", "active_alias": 42})
+            )
+            identity = await self._resolve(router)
+        assert identity["address"] == MY_ADDRESS
+
+    async def test_override_leads_without_evicting_aliases(self) -> None:
+        with respx.mock(assert_all_called=False) as router:
+            router.get(f"{API}/icloud/account").mock(
+                return_value=icloud_account_ok(
+                    active="+15551110000", aliases=["me@example.com", "+15551110000"]
+                )
+            )
+            identity = await self._resolve(router, override="me@example.com")
+        assert identity["address"] == "me@example.com"
+        assert identity["source"] == "override"
+        assert "+15551110000" in identity["addresses"]
 
 
 class TestGetServerInfo:

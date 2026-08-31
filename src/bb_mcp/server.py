@@ -86,6 +86,95 @@ PRIVATE_API_TOOLS = [
 ]
 
 
+def _account_aliases(account: Any) -> list[str]:
+    """Ordered, de-duplicated alias list from an ``/icloud/account`` payload.
+
+    ``active_alias`` leads: it is the address Apple currently sends from, which
+    makes it the right thing to report as *the* user's address. Hidden aliases are
+    dropped — ``IsUserVisible`` is false for addresses Apple keeps internally, and
+    surfacing those would be noise. ``Status`` is deliberately not filtered on: the
+    codes are undocumented and guessing at them risks discarding a live alias.
+    """
+    if not isinstance(account, dict):
+        return []
+    ordered: list[str] = []
+    active = account.get("active_alias")
+    if isinstance(active, str) and active.strip():
+        ordered.append(active.strip())
+    for entry in account.get("aliases") or []:
+        if not isinstance(entry, dict) or entry.get("IsUserVisible") is False:
+            continue
+        alias = entry.get("Alias")
+        if isinstance(alias, str) and alias.strip():
+            ordered.append(alias.strip())
+    seen: set[str] = set()
+    out: list[str] = []
+    for alias in ordered:
+        key = alias.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(alias)
+    return out
+
+
+async def _resolve_identity(
+    client: BlueBubblesClient, info: dict[str, Any], override: str | None
+) -> dict[str, Any]:
+    """Work out who the local user is, best source first.
+
+    Enriching from the Private API is strictly optional: any failure falls back to
+    the ``/server/info`` fields, which is exactly the behaviour on a server without
+    the Private API. Startup must not depend on it.
+    """
+    detected = [
+        a
+        for a in (info.get("detected_imessage"), info.get("detected_icloud"))
+        if isinstance(a, str) and a.strip()
+    ]
+    aliases: list[str] = []
+    name: str | None = None
+    source = "server_info"
+
+    if info.get("private_api"):
+        try:
+            account = await client.icloud_account()
+        except Exception as exc:  # noqa: BLE001 - enrichment is best-effort
+            logger.warning(
+                "Could not read /icloud/account (%s); falling back to the address "
+                "detected by /server/info.",
+                exc,
+            )
+        else:
+            aliases = _account_aliases(account)
+            if isinstance(account, dict):
+                raw_name = account.get("account_name")
+                name = raw_name.strip() if isinstance(raw_name, str) else None
+            if aliases:
+                source = "icloud_account"
+
+    # Detected addresses stay in the set even when aliases came back — they are
+    # what older code reported, and dropping one would silently narrow matching.
+    addresses = list(aliases)
+    seen = {a.lower() for a in addresses}
+    for addr in detected:
+        if addr.lower() not in seen:
+            seen.add(addr.lower())
+            addresses.append(addr)
+
+    # An explicit override wins the default slot without evicting anything.
+    if override and override.strip():
+        override = override.strip()
+        addresses = [override] + [a for a in addresses if a.lower() != override.lower()]
+        source = "override"
+
+    return {
+        "address": addresses[0] if addresses else None,
+        "addresses": addresses,
+        "name": name,
+        "source": source,
+    }
+
+
 @asynccontextmanager
 async def lifespan(server: FastMCP):
     url = os.environ.get("BLUEBUBBLES_URL")
@@ -118,12 +207,13 @@ async def lifespan(server: FastMCP):
     else:
         logger.info("BlueBubbles Private API is enabled — all tools available.")
     override = getattr(server, "_my_address_override", None)
-    me = override or info.get("detected_imessage") or info.get("detected_icloud")
+    identity = await _resolve_identity(client, info, override)
     try:
         yield {
             "bb": client,
             "private_api": bool(info.get("private_api")),
-            "me": me,
+            "me": identity["address"],
+            "identity": identity,
         }
     finally:
         await client.close()
@@ -284,20 +374,31 @@ async def _attach_chats(
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_my_address(ctx: Context) -> str:
-    """Get the iMessage address (email or phone number) for the user who owns this device.
+async def get_my_address(ctx: Context) -> dict[str, Any]:
+    """Get the iMessage addresses that identify the user who owns this device.
 
-    Returns the address that identifies the local user — useful for filtering
-    messages sent by the user (pass this value as from_address in search/fetch tools).
-    Returns the BLUEBUBBLES_MY_ADDRESS override if set, otherwise the address
-    detected from the BlueBubbles server.
+    An Apple account can receive on several addresses at once — typically a phone
+    number plus one or more emails. All of them are the same person.
+
+    Do NOT pass these values as `from_address` to search/fetch tools. That filter
+    matches the OTHER party in a conversation, so filtering on your own address
+    returns nothing (or, if you have a chat with yourself, only that thread).
+    To find messages you sent, pass the literal string 'me' instead.
+
+    Returns:
+        address: The primary address — Apple's currently active sending alias.
+        addresses: Every address belonging to the user, primary first.
+        name: The account holder's display name, when the server reports one.
+        source: Where this came from — 'icloud_account' (Private API, complete),
+                'server_info' (detected address only, may be missing aliases), or
+                'override' (BLUEBUBBLES_MY_ADDRESS).
     """
-    me = ctx.lifespan_context.get("me")
-    if not me:
+    identity = ctx.lifespan_context.get("identity") or {}
+    if not identity.get("address"):
         raise ValueError(
             "Could not determine user address: server did not return detected_imessage."
         )
-    return me
+    return identity
 
 
 @mcp.tool(annotations=READ_ONLY)
