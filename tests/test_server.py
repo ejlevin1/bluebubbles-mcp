@@ -1171,8 +1171,20 @@ class TestSkillResources:
 
 
 class TestCli:
-    def _run(self, monkeypatch: pytest.MonkeyPatch, *args: str) -> dict[str, Any]:
-        """Invoke the CLI with mcp.run stubbed; return the kwargs it was called with."""
+    ENV_VARS = (
+        "BLUEBUBBLES_MCP_HOST",
+        "BLUEBUBBLES_MCP_PORT",
+        "BLUEBUBBLES_MCP_PATH",
+        "BLUEBUBBLES_MCP_AUTH_TOKEN",
+    )
+
+    def _invoke(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *args: str,
+        env: dict[str, str] | None = None,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Invoke the CLI with mcp.run stubbed; return the result and run() kwargs."""
         from typer.testing import CliRunner
 
         from bb_mcp import server
@@ -1182,8 +1194,21 @@ class TestCli:
         def fake_run(**kwargs: Any) -> None:
             captured.update(kwargs)
 
+        for name in self.ENV_VARS:
+            monkeypatch.delenv(name, raising=False)
         monkeypatch.setattr(server.mcp, "run", fake_run)
-        result = CliRunner().invoke(server.app, list(args))
+        # main() sets mcp.auth in HTTP mode; restore it so tests stay isolated.
+        monkeypatch.setattr(server.mcp, "auth", None)
+        result = CliRunner().invoke(server.app, list(args), env=env)
+        return result, captured
+
+    def _run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *args: str,
+        env: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        result, captured = self._invoke(monkeypatch, *args, env=env)
         assert result.exit_code == 0, result.output
         return captured
 
@@ -1194,3 +1219,137 @@ class TestCli:
 
     def test_runs_over_stdio(self, monkeypatch: pytest.MonkeyPatch) -> None:
         assert self._run(monkeypatch)["transport"] == "stdio"
+
+    def test_stdio_passes_no_http_options(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert self._run(monkeypatch) == {"transport": "stdio", "show_banner": False}
+
+    def test_stdio_writes_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Any stdout output in stdio mode would corrupt the protocol stream."""
+        result, _ = self._invoke(monkeypatch)
+        assert result.output == ""
+
+    def test_host_selects_http_with_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert self._run(monkeypatch, "--host", "127.0.0.1") == {
+            "transport": "http",
+            "host": "127.0.0.1",
+            "port": 8000,
+            "path": "/mcp",
+            "show_banner": False,
+        }
+
+    def test_http_custom_port_and_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured = self._run(
+            monkeypatch, "--host", "0.0.0.0", "--port", "9001", "--path", "/bb"
+        )
+        assert captured["host"] == "0.0.0.0"
+        assert captured["port"] == 9001
+        assert captured["path"] == "/bb"
+
+    def test_env_vars_match_flags(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured = self._run(
+            monkeypatch,
+            env={
+                "BLUEBUBBLES_MCP_HOST": "0.0.0.0",
+                "BLUEBUBBLES_MCP_PORT": "9001",
+                "BLUEBUBBLES_MCP_PATH": "/bb",
+            },
+        )
+        assert captured == {
+            "transport": "http",
+            "host": "0.0.0.0",
+            "port": 9001,
+            "path": "/bb",
+            "show_banner": False,
+        }
+
+    def test_http_logs_listening_line(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        result, _ = self._invoke(monkeypatch, "--host", "127.0.0.1", "--port", "8123")
+        assert "bb-mcp listening on http://127.0.0.1:8123/mcp" in result.stderr
+        assert "bb-mcp listening" not in result.stdout
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ("--port", "9001"),
+            ("--path", "/bb"),
+            ("--auth-token", "secret"),
+        ],
+    )
+    def test_http_option_without_host_is_error(
+        self, monkeypatch: pytest.MonkeyPatch, args: tuple[str, ...]
+    ) -> None:
+        result, captured = self._invoke(monkeypatch, *args)
+        assert result.exit_code != 0
+        assert "require --host" in result.output
+        assert captured == {}
+
+    @pytest.mark.parametrize(
+        "name,value",
+        [
+            ("BLUEBUBBLES_MCP_PORT", "9001"),
+            ("BLUEBUBBLES_MCP_PATH", "/bb"),
+            ("BLUEBUBBLES_MCP_AUTH_TOKEN", "secret"),
+        ],
+    )
+    def test_http_env_var_without_host_is_error(
+        self, monkeypatch: pytest.MonkeyPatch, name: str, value: str
+    ) -> None:
+        result, captured = self._invoke(monkeypatch, env={name: value})
+        assert result.exit_code != 0
+        assert "require --host" in result.output
+        assert captured == {}
+
+    def test_auth_token_installs_verifier(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+
+        from bb_mcp import server
+
+        self._run(monkeypatch, "--host", "127.0.0.1", "--auth-token", "s3cret")
+        auth = server.mcp.auth
+        assert isinstance(auth, StaticTokenVerifier)
+        assert "s3cret" in auth.tokens
+
+    async def test_auth_token_verifier_accepts_only_the_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from bb_mcp import server
+
+        self._run(monkeypatch, "--host", "127.0.0.1", "--auth-token", "s3cret")
+        auth = server.mcp.auth
+        assert auth is not None
+        assert await auth.verify_token("s3cret") is not None
+        assert await auth.verify_token("wrong") is None
+
+    def test_no_auth_by_default_in_http(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from bb_mcp import server
+
+        self._run(monkeypatch, "--host", "127.0.0.1")
+        assert server.mcp.auth is None
+
+    def test_non_loopback_without_token_warns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result, _ = self._invoke(monkeypatch, "--host", "0.0.0.0")
+        assert result.exit_code == 0
+        assert "NO authentication" in result.stderr
+
+    @pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost"])
+    def test_loopback_without_token_does_not_warn(
+        self, monkeypatch: pytest.MonkeyPatch, host: str
+    ) -> None:
+        result, _ = self._invoke(monkeypatch, "--host", host)
+        assert "WARNING" not in result.stderr
+
+    def test_non_loopback_with_token_does_not_warn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result, _ = self._invoke(
+            monkeypatch, "--host", "0.0.0.0", "--auth-token", "s3cret"
+        )
+        assert "WARNING" not in result.stderr
