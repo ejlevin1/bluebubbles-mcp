@@ -106,6 +106,77 @@ just setup   # installs deps and git hooks
 }
 ```
 
+## HTTP mode
+
+By default `bb-mcp` speaks MCP over stdio. Pass `--host` (or set `BLUEBUBBLES_MCP_HOST`)
+to serve [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#streamable-http)
+instead, so one long-running server can be shared by several clients or reached over the network.
+
+| Flag | Env var | Default | Notes |
+|------|---------|---------|-------|
+| `--host` | `BLUEBUBBLES_MCP_HOST` | unset (stdio) | Setting it switches to HTTP. `127.0.0.1` for local only, `0.0.0.0` for all interfaces. |
+| `--port` | `BLUEBUBBLES_MCP_PORT` | `8000` | Requires `--host`. |
+| `--path` | `BLUEBUBBLES_MCP_PATH` | `/mcp` | Requires `--host`. |
+| `--auth-token` | `BLUEBUBBLES_MCP_AUTH_TOKEN` | unset | Requires `--host`. Clients must send `Authorization: Bearer <token>`. |
+
+`--port`, `--path` or `--auth-token` without `--host` is an error rather than being silently
+ignored. The default port is 8000, not 5678, because n8n already uses 5678.
+
+> **Security:** this server can read and send your iMessages. When `--host` is anything other
+> than a loopback address (`127.0.0.1`, `::1`, `localhost`), set `--auth-token`; `bb-mcp`
+> prints a warning on startup if you don't. The token is a shared secret over plain HTTP, so put
+> a TLS-terminating reverse proxy in front of it if it leaves a trusted network.
+
+### uvx
+
+```bash
+export BLUEBUBBLES_URL=https://your-bluebubbles-server
+export BLUEBUBBLES_PASSWORD=your-server-password
+export BLUEBUBBLES_MCP_AUTH_TOKEN=$(openssl rand -hex 32)
+uvx --from git+https://github.com/ejlevin1/bluebubbles-mcp bb-mcp --host 0.0.0.0 --port 8000
+```
+
+### Docker
+
+The image runs stdio by default; setting `BLUEBUBBLES_MCP_HOST` switches it to HTTP:
+
+```bash
+docker run --rm \
+  -e BLUEBUBBLES_URL=https://your-bluebubbles-server \
+  -e BLUEBUBBLES_PASSWORD=your-server-password \
+  -e BLUEBUBBLES_MCP_HOST=0.0.0.0 \
+  -e BLUEBUBBLES_MCP_AUTH_TOKEN=your-token \
+  -p 8000:8000 \
+  ghcr.io/ejlevin1/bluebubbles-mcp:latest
+```
+
+With docker-compose: `docker compose --profile http up bluebubbles-mcp-http`
+(reads `BLUEBUBBLES_MCP_AUTH_TOKEN` from `.env`).
+
+### Connecting a client
+
+Claude Code:
+
+```bash
+claude mcp add --transport http bluebubbles http://<host>:8000/mcp \
+  --header "Authorization: Bearer your-token"
+```
+
+Drop `--header` if you did not set a token. Other clients that support Streamable HTTP take the
+same URL and header, e.g.:
+
+```json
+{
+  "mcpServers": {
+    "bluebubbles": {
+      "type": "http",
+      "url": "http://<host>:8000/mcp",
+      "headers": { "Authorization": "Bearer your-token" }
+    }
+  }
+}
+```
+
 ## Tools
 
 Tools marked **Private API** are removed from the tool list at startup when the
