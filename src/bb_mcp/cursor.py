@@ -1,8 +1,10 @@
 """Pure cursor arithmetic for incremental message polling.
 
-No I/O, no imports from :mod:`bb_mcp.client` or :mod:`bb_mcp.server`. Everything here
-is a plain function over plain data so it can be unit-tested directly — which matters,
-because every subtle bug in incremental polling lives in this file.
+No I/O, and no module-level import of :mod:`bb_mcp.client` or :mod:`bb_mcp.server` —
+:func:`_scope_key` defers its one client import because :mod:`bb_mcp.client` imports
+this module. Everything here is a plain function over plain data so it can be
+unit-tested directly — which matters, because every subtle bug in incremental polling
+lives in this file.
 
 Two facts about the BlueBubbles/chat.db wire format drive the whole design:
 
@@ -35,9 +37,18 @@ FUTURE_SKEW_MS: Final = 300_000
 #: ``limit + 1`` to detect truncation, so the largest limit we may ask for is 999.
 MAX_PAGE: Final = 999
 
-#: Bumped when the encoded cursor layout changes, so an old cursor fails loudly in
-#: :meth:`Cursor.parse` instead of being silently mis-read as the new layout.
+#: The layout emitted for a GLOBAL poll: ``v1|created|changed``.
 CURSOR_VERSION: Final = "v1"
+
+#: The layout emitted for a poll scoped to one chat: ``v2|created|changed|<chat>``.
+#: Which version we emit depends on scope, not on age, so ``CURSOR_VERSION`` is
+#: deliberately NOT reassigned as layouts are added: every in-flight ``v1`` token
+#: would then hit the ``v\d+`` catch-all in :meth:`Cursor.parse` and raise.
+CURSOR_VERSION_SCOPED: Final = "v2"
+
+#: Every layout :meth:`Cursor.parse` accepts. A versioned token outside this set
+#: fails loudly there instead of being silently mis-read as one of these.
+CURSOR_VERSIONS: Final = frozenset({CURSOR_VERSION, CURSOR_VERSION_SCOPED})
 
 #: Below this, an all-digit ``since`` is read as epoch *seconds* rather than epoch ms.
 #: 1e11 ms is 1973; 1e11 s is the year 5138. Nothing real is ambiguous.
@@ -157,6 +168,29 @@ def clamp_to_now(unix_ms: int, now_ms: int) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _scope_key(scope: str | None) -> str | None:
+    """Canonical key for a chat scope, or ``None`` for a global poll.
+
+    ``iMessage;-;X`` and ``any;-;X`` address the same chat, so both must produce the
+    same key — otherwise an agent polling one way and then the other would be told
+    its cursor belongs to another scope, for two identical queries.
+
+    The normalisation lives on the client and is imported lazily rather than
+    duplicated here: :mod:`bb_mcp.client` imports this module at module level, so a
+    top-level import back would be circular.
+    """
+    if not scope:
+        return None
+    from bb_mcp.client import BlueBubblesClient
+
+    return BlueBubblesClient._normalize_guid(scope)
+
+
+def _scope_label(scope: str | None) -> str:
+    """How a scope is named in an error the model has to act on."""
+    return "all chats" if scope is None else f"chat {scope}"
+
+
 @dataclass(frozen=True, slots=True)
 class Cursor:
     """Two independent monotonic watermarks, both Unix ms.
@@ -171,9 +205,18 @@ class Cursor:
     created_ms: int
     changed_ms: int
 
-    def encode(self) -> str:
-        """Render as the opaque token callers echo back."""
-        return f"{CURSOR_VERSION}|{self.created_ms}|{self.changed_ms}"
+    def encode(self, scope: str | None = None) -> str:
+        """Render as the opaque token callers echo back.
+
+        ``scope`` is the chat a scoped poll was confined to. It rides in the token
+        rather than on the dataclass on purpose: :func:`merge_monotonic` rebuilds a
+        cursor field-wise and equality drives the stall signal, so both must keep
+        seeing exactly two watermarks.
+        """
+        key = _scope_key(scope)
+        if key is None:
+            return f"{CURSOR_VERSION}|{self.created_ms}|{self.changed_ms}"
+        return f"{CURSOR_VERSION_SCOPED}|{self.created_ms}|{self.changed_ms}|{key}"
 
     @classmethod
     def seed(cls, unix_ms: int) -> Cursor:
@@ -182,7 +225,9 @@ class Cursor:
         return cls(created_ms=ms, changed_ms=ms)
 
     @classmethod
-    def parse(cls, raw: str | int, *, now_ms: int) -> Cursor:
+    def parse(
+        cls, raw: str | int, *, now_ms: int, expect_scope: str | None = None
+    ) -> Cursor:
         """Inverse of :meth:`encode`, plus the human-friendly seed forms.
 
         Accepted: an encoded cursor, epoch ms, epoch seconds, or an ISO-8601
@@ -191,6 +236,14 @@ class Cursor:
         Anything else raises :class:`ValueError`. It deliberately never falls back to
         "now" or "the beginning of time" — both would hide the mistake behind a
         plausible-looking empty or enormous result.
+
+        ``expect_scope`` is the chat this call is scoped to, or ``None`` for a global
+        poll. An *encoded* token whose scope differs raises in both directions: a
+        cursor is a time watermark for the scope it was minted in, and carrying one
+        across scopes silently skips whatever the other scope saw meanwhile. **Seeds
+        are scope-neutral** — an epoch, an ISO date or anything else the model typed
+        simply adopts ``expect_scope``, since otherwise every first scoped poll would
+        fail.
         """
         if isinstance(raw, bool):
             raise ValueError(_BAD_CURSOR.format(value=raw))
@@ -201,14 +254,31 @@ class Cursor:
         if not text:
             raise ValueError(_BAD_CURSOR.format(value=raw))
 
-        if text.startswith(f"{CURSOR_VERSION}|"):
-            parts = text.split("|")
-            if len(parts) != 3:
+        version, separator, _ = text.partition("|")
+        if separator and version in CURSOR_VERSIONS:
+            scoped = version == CURSOR_VERSION_SCOPED
+            # maxsplit stops a scope from shifting the numeric segments; a scope
+            # still holding a "|" is not one we ever minted, so it is malformed. An
+            # empty one is malformed too, and quietly so: it normalises to None and
+            # would pass a global poll's scope check, seeding a global walk from a
+            # token we never minted.
+            parts = text.split("|", 3)
+            if len(parts) != (4 if scoped else 3) or (
+                scoped and (not parts[3].strip() or "|" in parts[3])
+            ):
                 raise ValueError(_BAD_CURSOR.format(value=raw))
             try:
                 created, changed = int(parts[1]), int(parts[2])
             except ValueError:
                 raise ValueError(_BAD_CURSOR.format(value=raw)) from None
+            expected = _scope_key(expect_scope)
+            found = _scope_key(parts[3]) if scoped else None
+            if found != expected:
+                raise ValueError(
+                    _SCOPE_MISMATCH.format(
+                        found=_scope_label(found), expected=_scope_label(expected)
+                    )
+                )
             return cls(
                 created_ms=clamp_to_now(max(0, created), now_ms),
                 changed_ms=clamp_to_now(max(0, changed), now_ms),
@@ -238,6 +308,16 @@ _BAD_CURSOR: Final = (
     "Could not read {value!r} as a cursor. Pass the `cursor` value from the previous "
     "response verbatim — do not construct or edit it. To start from a specific point "
     "instead, pass an ISO-8601 timestamp or epoch milliseconds."
+)
+
+#: Deliberately not _BAD_CURSOR: the token is perfectly well formed and was echoed
+#: back verbatim, so telling the caller to do exactly that is wrong advice.
+_SCOPE_MISMATCH: Final = (
+    "This cursor was minted for {found} but this call polls {expected}. A cursor is a "
+    "time watermark for one scope, so carrying it across scopes would silently skip "
+    "everything the other scope saw in between. Keep one cursor per scope: repeat this "
+    "call without `cursor` to start a new one here, and echo each scope's own cursor "
+    "back to it."
 )
 
 

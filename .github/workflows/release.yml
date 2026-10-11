@@ -85,6 +85,13 @@ jobs:
           # and every commit since it.
           fetch-depth: 0
           ref: main
+          # GITHUB_TOKEN authenticates as the github-actions app, which cannot
+          # satisfy main's ruleset: its bypass list only accepts a repository
+          # role, and the Integration actor type is org-only, so it is not
+          # addable on a personal repo. The push of the version commit is
+          # rejected with GH013. A PAT pushes as a user holding the admin role,
+          # which the bypass list does accept.
+          token: ${{ secrets.RELEASE_PAT }}
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -94,7 +101,7 @@ jobs:
         id: release
         uses: python-semantic-release/python-semantic-release@v10.6.2
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_token: ${{ secrets.RELEASE_PAT }}
 
       - name: Report
         run: |
@@ -109,11 +116,14 @@ jobs:
           fi
 
   # The versioned image must be built AFTER the tag exists, from the tagged
-  # commit. Chaining it here rather than relying on docker.yml's `tags: v*`
-  # trigger is deliberate: GitHub does not start workflows from events created
-  # with GITHUB_TOKEN, so the tag semantic-release pushes never fires that
-  # trigger. (A hand-pushed tag does — which is why v0.5.0 got an image and
-  # v0.5.1 did not.)
+  # commit. This is chained rather than left to docker.yml's `tags: v*`
+  # trigger so it does not depend on how the tag was created: a tag pushed with
+  # GITHUB_TOKEN starts no workflow at all, while one pushed with the PAT above
+  # does. Keeping the chain means the versioned image is built either way — at
+  # the cost of docker.yml also firing on the PAT-pushed tag, so the same image
+  # is built twice. Harmless (both builds produce identical content for the
+  # same tag) and worth the redundancy; drop `tags` from docker.yml if the
+  # duplicate build becomes annoying.
   docker:
     needs: release
     if: needs.release.outputs.released == 'true'

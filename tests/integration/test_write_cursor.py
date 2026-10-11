@@ -22,12 +22,14 @@ from collections.abc import AsyncGenerator
 import pytest
 from fastmcp import Client
 
+from bb_mcp.client import BlueBubblesClient
 from bb_mcp.cursor import Cursor
 
 pytestmark = [pytest.mark.integration, pytest.mark.write]
 
-#: How long to wait for a sent message to land in chat.db. AppleScript sends are
-#: asynchronous — the POST returns before Messages has committed the row.
+#: How long to wait for a sent message to land in chat.db. Sends are asynchronous on
+#: both paths — Private API and AppleScript alike, the POST returns before Messages
+#: has committed the row.
 DELIVERY_TIMEOUT_S = 45.0
 POLL_INTERVAL_S = 1.5
 
@@ -47,17 +49,27 @@ def _marker() -> str:
 
 
 async def _poll_until(
-    tools: Client, cursor: str, predicate, deadline: float
+    tools: Client,
+    cursor: str,
+    predicate,
+    deadline: float,
+    chat_guid: str | None = None,
 ) -> tuple[list[dict], str]:
     """Drain the cursor until `predicate` sees what it wants, or time runs out.
 
     Returns every message collected across the walk and the final cursor. Draining
     `has_more` fully matters: a backlog would otherwise be mistaken for the message
     never arriving.
+
+    `chat_guid` scopes the walk; it must match the scope the cursor was minted in,
+    since a cursor carried across scopes is rejected rather than reinterpreted.
     """
+    args: dict = {} if chat_guid is None else {"chat_guid": chat_guid}
     collected: list[dict] = []
     while True:
-        result = (await tools.call_tool("get_recent_messages", {"since": cursor})).data
+        result = (
+            await tools.call_tool("get_recent_messages", {"since": cursor, **args})
+        ).data
         collected.extend(result["messages"])
         cursor = result["cursor"]
         if predicate(collected):
@@ -159,3 +171,90 @@ async def test_a_send_is_not_visible_to_a_cursor_minted_after_it(
         await tools.call_tool("get_recent_messages", {"since": window["cursor"]})
     ).data
     assert not any(m.get("text") == marker for m in fresh["messages"])
+
+
+async def _unrelated_chat_guid(tools: Client, test_write_guid: str) -> str:
+    """A readable chat that is NOT the write target, or skip.
+
+    Checked with `get_chat` first: the scoped poll validates its chat GUID the same
+    way, and a candidate the server cannot read would fail this test for a reason
+    that has nothing to do with scoping.
+    """
+    target = BlueBubblesClient._normalize_guid(test_write_guid)
+    chats = (await tools.call_tool("list_chats", {"limit": 25})).data
+    for chat in chats:
+        guid = chat.get("guid") or ""
+        if not guid or BlueBubblesClient._normalize_guid(guid) == target:
+            continue
+        probe = await tools.call_tool(
+            "get_chat", {"chat_guid": guid}, raise_on_error=False
+        )
+        if not probe.is_error:
+            return guid
+    pytest.skip("no second readable chat on this server to prove scoping against")
+
+
+async def test_a_scoped_poll_sees_its_own_chat_and_no_other(
+    tools: Client, test_write_guid: str
+) -> None:
+    """Scoping is only worth having if it both includes and excludes.
+
+    One send, checked from two scoped cursors: the target chat's must deliver it, an
+    unrelated chat's must not. Sharing the send keeps this to a single real message.
+    """
+    other_guid = await _unrelated_chat_guid(tools, test_write_guid)
+
+    start = (
+        await tools.call_tool(
+            "get_recent_messages", {"minutes": 1, "chat_guid": test_write_guid}
+        )
+    ).data
+    cursor = start["cursor"]
+    assert cursor.startswith("v2|"), "a scoped poll must mint a scoped cursor"
+    other_cursor = (
+        await tools.call_tool(
+            "get_recent_messages", {"minutes": 1, "chat_guid": other_guid}
+        )
+    ).data["cursor"]
+
+    marker = _marker()
+    await tools.call_tool(
+        "send_message", {"chat_guid": test_write_guid, "message": marker}
+    )
+
+    collected, cursor = await _poll_until(
+        tools,
+        cursor,
+        lambda rows: any(m.get("text") == marker for m in rows),
+        time.monotonic() + DELIVERY_TIMEOUT_S,
+        chat_guid=test_write_guid,
+    )
+    assert any(m.get("text") == marker for m in collected), (
+        f"scoped cursor never delivered the send within {DELIVERY_TIMEOUT_S}s"
+    )
+    target = BlueBubblesClient._normalize_guid(test_write_guid)
+    assert all(
+        [c.get("guid") for c in m.get("chats") or []] == [target] for m in collected
+    ), "a scoped poll returned a row attributed to another chat"
+
+    # The unrelated chat's own cursor, minted before the send, must stay clean.
+    elsewhere = (
+        await tools.call_tool(
+            "get_recent_messages", {"since": other_cursor, "chat_guid": other_guid}
+        )
+    ).data
+    assert not any(m.get("text") == marker for m in elsewhere["messages"]), (
+        "a send leaked into an unrelated chat's scoped poll"
+    )
+
+    # And the two cursors are not interchangeable, in either direction.
+    crossed = await tools.call_tool(
+        "get_recent_messages",
+        {"since": cursor, "chat_guid": other_guid},
+        raise_on_error=False,
+    )
+    assert crossed.is_error, "a cursor was accepted for a chat it was not minted for"
+    unscoped = await tools.call_tool(
+        "get_recent_messages", {"since": cursor}, raise_on_error=False
+    )
+    assert unscoped.is_error, "a scoped cursor was accepted on a global poll"
