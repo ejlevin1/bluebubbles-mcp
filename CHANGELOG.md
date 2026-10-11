@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.1.0 (2026-10-11)
+
+### Testing
+
+- **server**: Strip ANSI before matching CLI usage errors
+  ([`8ff264f`](https://github.com/ejlevin1/bluebubbles-mcp/commit/8ff264ffff52aab7adb8fb3f3ae4ba9f9b4515c1))
+
+
 ## v1.0.0 (2026-08-31)
 
 ### Bug Fixes
