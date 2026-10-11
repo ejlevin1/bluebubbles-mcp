@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import re
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -1998,6 +1999,11 @@ class TestSkillResources:
 # ---------------------------------------------------------------------------
 
 
+def _plain(text: str) -> str:
+    """Strip ANSI styling: Rich colours Typer errors when CI forces colour output."""
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
 class TestCli:
     ENV_VARS = (
         "BLUEBUBBLES_MCP_HOST",
@@ -2112,7 +2118,7 @@ class TestCli:
     ) -> None:
         result, captured = self._invoke(monkeypatch, *args)
         assert result.exit_code != 0
-        assert "require --host" in result.output
+        assert "require --host" in _plain(result.output)
         assert captured == {}
 
     @pytest.mark.parametrize(
@@ -2128,7 +2134,7 @@ class TestCli:
     ) -> None:
         result, captured = self._invoke(monkeypatch, env={name: value})
         assert result.exit_code != 0
-        assert "require --host" in result.output
+        assert "require --host" in _plain(result.output)
         assert captured == {}
 
     def test_auth_token_installs_verifier(
