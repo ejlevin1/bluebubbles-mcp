@@ -23,4 +23,8 @@ ENV VIRTUAL_ENV=/app/.venv \
     PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="/app/src"
 
+# stdio by default, so existing `docker run -i` configs keep working. Set
+# BLUEBUBBLES_MCP_HOST=0.0.0.0 to serve Streamable HTTP on this port instead.
+EXPOSE 8000
+
 CMD ["python", "-m", "bb_mcp.server"]

@@ -6,3 +6,18 @@ services:
     environment:
       BLUEBUBBLES_URL: ${BLUEBUBBLES_URL}
       BLUEBUBBLES_PASSWORD: ${BLUEBUBBLES_PASSWORD}
+
+  # HTTP mode: `docker compose --profile http up bluebubbles-mcp-http`, then
+  # point clients at http://localhost:8000/mcp. Set BLUEBUBBLES_MCP_AUTH_TOKEN
+  # in .env -- this server can read and send iMessages.
+  bluebubbles-mcp-http:
+    profiles: [http]
+    build: .
+    image: bluebubbles-mcp:latest
+    ports:
+      - "8000:8000"
+    environment:
+      BLUEBUBBLES_URL: ${BLUEBUBBLES_URL}
+      BLUEBUBBLES_PASSWORD: ${BLUEBUBBLES_PASSWORD}
+      BLUEBUBBLES_MCP_HOST: 0.0.0.0
+      BLUEBUBBLES_MCP_AUTH_TOKEN: ${BLUEBUBBLES_MCP_AUTH_TOKEN:-}

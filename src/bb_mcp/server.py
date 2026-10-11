@@ -10,8 +10,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
+import click
 import typer
 from fastmcp import Context, FastMCP
+from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.providers.skills import SkillProvider
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.types import Image
@@ -1413,6 +1415,10 @@ async def send_attachment(
 
 app = typer.Typer()
 
+DEFAULT_HTTP_PORT = 8000
+DEFAULT_HTTP_PATH = "/mcp"
+LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
 
 @app.command()
 def main(
@@ -1429,13 +1435,72 @@ def main(
         help="Override the detected iMessage address for the local user (e.g. '+15551234567'). "
         "Defaults to the address reported by the BlueBubbles server.",
     ),
+    host: str | None = typer.Option(
+        None,
+        "--host",
+        envvar="BLUEBUBBLES_MCP_HOST",
+        help="Serve Streamable HTTP on this address instead of stdio (e.g. 127.0.0.1 or 0.0.0.0).",
+    ),
+    # port/path/auth_token default to None so an explicit value can be told apart
+    # from the default and rejected when --host is missing.
+    port: int | None = typer.Option(
+        None,
+        "--port",
+        envvar="BLUEBUBBLES_MCP_PORT",
+        help=f"HTTP port. Requires --host. Default: {DEFAULT_HTTP_PORT}.",
+        show_default=False,
+    ),
+    path: str | None = typer.Option(
+        None,
+        "--path",
+        envvar="BLUEBUBBLES_MCP_PATH",
+        help=f"HTTP endpoint path. Requires --host. Default: {DEFAULT_HTTP_PATH}.",
+        show_default=False,
+    ),
+    auth_token: str | None = typer.Option(
+        None,
+        "--auth-token",
+        envvar="BLUEBUBBLES_MCP_AUTH_TOKEN",
+        help="Require 'Authorization: Bearer <token>' on HTTP requests. Requires --host.",
+        show_default=False,
+    ),
 ) -> None:
+    if not host:
+        if port is not None or path is not None or auth_token:
+            raise click.UsageError(
+                "--port/--path/--auth-token require --host (HTTP mode)"
+            )
+
     mcp.mask_error_details = mask_errors  # type: ignore[attr-defined]
     mcp._my_address_override = my_address  # type: ignore[attr-defined]
-    # No banner: it is an ASCII art box plus a PyPI update nag written to
-    # stderr, which is noise in an MCP client's logs. Suppressing it also
-    # skips the version-check HTTP call on every startup.
-    mcp.run(transport="stdio", show_banner=False)
+
+    if not host:
+        # No banner: it is an ASCII art box plus a PyPI update nag written to
+        # stderr, which is noise in an MCP client's logs. Suppressing it also
+        # skips the version-check HTTP call on every startup.
+        mcp.run(transport="stdio", show_banner=False)
+        return
+
+    port = DEFAULT_HTTP_PORT if port is None else port
+    path = DEFAULT_HTTP_PATH if path is None else path
+    if auth_token:
+        mcp.auth = StaticTokenVerifier(
+            tokens={auth_token: {"client_id": "bb-mcp", "scopes": []}}
+        )
+    elif host not in LOOPBACK_HOSTS:
+        # This server can read and send the user's iMessages; an open port on a
+        # non-loopback interface hands that to anyone who can reach it.
+        typer.secho(
+            f"WARNING: bb-mcp is listening on {host} with NO authentication. Anyone who can "
+            "reach this port can read and send iMessages. Set --auth-token / "
+            "BLUEBUBBLES_MCP_AUTH_TOKEN or bind to 127.0.0.1.",
+            fg=typer.colors.RED,
+            bold=True,
+            err=True,
+        )
+    display_host = f"[{host}]" if ":" in host else host
+    typer.echo(f"bb-mcp listening on http://{display_host}:{port}{path}", err=True)
+    mcp.run(transport="http", host=host, port=port, path=path, show_banner=False)
 
 
 if __name__ == "__main__":
